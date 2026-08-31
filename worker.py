@@ -13,7 +13,11 @@ import config
 import webull_client as wb
 from strategy import Bar, analyze, levels
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 log = logging.getLogger("worker")
 
 running = True
@@ -21,23 +25,28 @@ _state_lock = threading.Lock()
 
 ET = ZoneInfo(config.TIMEZONE)
 
+
 # ============================================================
 # AGGRESSIVE ORDER PRICING
 # ============================================================
 #
 # ENTRY:
 # Buy slightly ABOVE the current ask.
-# Example: ask = 0.70 -> submit 0.72
+#
+# Example:
+#   ask = 0.70
+#   limit = 0.72
 #
 # EXIT:
 # Sell slightly BELOW the current bid.
-# Example: bid = 0.62 -> submit 0.59
 #
-# These are LIMIT orders, not market orders.
-# The purpose is to make the limit order aggressive enough to
-# cross the spread and maximize the chance of an immediate fill
-# while still retaining limit-price protection.
+# Example:
+#   bid = 0.62
+#   limit = 0.59
 #
+# These remain LIMIT orders.
+# ============================================================
+
 ENTRY_PRICE_OFFSET = 0.02
 EXIT_PRICE_OFFSET = 0.03
 
@@ -51,7 +60,9 @@ def load():
     try:
         with open(config.STATE_PATH, "r", encoding="utf-8") as handle:
             state = json.load(handle)
+
         return state if isinstance(state, dict) else default_state()
+
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return default_state()
 
@@ -71,11 +82,13 @@ def default_state():
 def save(state):
     directory = os.path.dirname(os.path.abspath(config.STATE_PATH))
     os.makedirs(directory, exist_ok=True)
+
     tmp = config.STATE_PATH + ".tmp"
 
     with _state_lock:
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(state, handle, indent=2, default=str)
+
         os.replace(tmp, config.STATE_PATH)
 
 
@@ -90,19 +103,24 @@ def parse_hhmm(value):
 
 def at_or_after(hhmm, dt=None):
     dt = dt or now_et()
+
     h, m = parse_hhmm(hhmm)
+
     return (dt.hour, dt.minute, dt.second) >= (h, m, 0)
 
 
 def in_rth(dt=None):
     dt = dt or now_et()
+
     sh, sm = parse_hhmm(config.RTH_START)
     eh, em = parse_hhmm(config.RTH_END)
+
     return (sh, sm) <= (dt.hour, dt.minute) < (eh, em)
 
 
 def new_entries_allowed(dt=None):
     dt = dt or now_et()
+
     return (
         in_rth(dt)
         and not at_or_after(config.NO_NEW_ENTRIES_AFTER, dt)
@@ -111,7 +129,10 @@ def new_entries_allowed(dt=None):
 
 
 def force_exit_due(dt=None):
-    return at_or_after(config.FORCE_EXIT_TIME, dt) and at_or_after(config.RTH_START, dt)
+    return (
+        at_or_after(config.FORCE_EXIT_TIME, dt)
+        and at_or_after(config.RTH_START, dt)
+    )
 
 
 def position_contract(pos):
@@ -121,6 +142,7 @@ def position_contract(pos):
 def position_age_seconds(pos):
     try:
         started = datetime.fromisoformat(pos["entry_time"])
+
         return max(
             0.0,
             (
@@ -128,8 +150,14 @@ def position_age_seconds(pos):
                 - started.astimezone(timezone.utc)
             ).total_seconds(),
         )
+
     except (KeyError, TypeError, ValueError):
         return float("inf")
+
+
+# ============================================================
+# AGGRESSIVE PRICING
+# ============================================================
 
 
 def aggressive_entry_price(ask):
@@ -138,10 +166,8 @@ def aggressive_entry_price(ask):
 
     Example:
         ask 0.70 -> 0.72
-
-    This remains a LIMIT order but gives the order room to
-    execute if the option is moving upward quickly.
     """
+
     if ask is None or ask <= 0:
         return None
 
@@ -154,20 +180,28 @@ def aggressive_exit_price(bid):
 
     Example:
         bid 0.62 -> 0.59
-
-    This is intentionally more aggressive than selling exactly
-    at the bid. A sell limit below the current bid should be
-    immediately marketable against the available bid, subject
-    to Webull/exchange execution and available liquidity.
     """
+
     if bid is None or bid <= 0:
         return None
 
-    return round(max(0.01, bid - EXIT_PRICE_OFFSET), 2)
+    return round(
+        max(0.01, bid - EXIT_PRICE_OFFSET),
+        2,
+    )
+
+
+# ============================================================
+# ENTRY RECONCILIATION
+# ============================================================
 
 
 def entry_fill_state(trade, state):
-    """Reconcile a pending entry against order detail AND actual position."""
+    """
+    Reconcile a pending entry against order detail AND
+    the actual Webull position.
+    """
+
     order = state.get("entry_order") or {}
     cid = order.get("client_order_id")
 
@@ -189,8 +223,10 @@ def entry_fill_state(trade, state):
 
     if not position_result.get("success"):
         log.warning(
-            "ENTRY RECONCILE: position query failed; keeping PENDING_ENTRY"
+            "ENTRY RECONCILE: position query failed; "
+            "keeping PENDING_ENTRY"
         )
+
         return state, False
 
     pos = wb.find_matching_option_position(
@@ -201,50 +237,70 @@ def entry_fill_state(trade, state):
 
     if isinstance(pos, dict) and pos.get("ambiguous"):
         state["state"] = "RECOVERY_REQUIRED"
+
         state["last_error"] = (
-            "Multiple matching Webull option positions; refusing to guess"
+            "Multiple matching Webull option positions; "
+            "refusing to guess"
         )
+
         log.error(
-            "ENTRY RECONCILE: ambiguous position match; trading halted"
+            "ENTRY RECONCILE: ambiguous position match; "
+            "trading halted"
         )
+
         return state, True
 
     status_class = detail.get("status_class")
     filled_qty = detail.get("filled_qty") or 0
     filled_price = detail.get("filled_price")
 
-    # If an entry remains unfilled beyond the configured timeout,
-    # cancel it before considering another entry.
     submitted_at = order.get("submitted_at")
 
     if status_class == "PENDING" and submitted_at:
         try:
             age = (
                 datetime.now(timezone.utc)
-                - datetime.fromisoformat(submitted_at).astimezone(timezone.utc)
+                - datetime.fromisoformat(
+                    submitted_at
+                ).astimezone(timezone.utc)
             ).total_seconds()
+
         except (TypeError, ValueError):
             age = 0
 
         if age >= config.ENTRY_ORDER_TIMEOUT_SECONDS:
+
             try:
-                cancel = wb.cancel_order(trade, cid)
+                cancel = wb.cancel_order(
+                    trade,
+                    cid,
+                )
+
                 log.warning(
                     "ENTRY TIMEOUT: cancel %s -> %s",
                     cid,
                     cancel,
                 )
+
             except Exception:
                 log.exception(
-                    "ENTRY TIMEOUT: cancel failed; keeping PENDING_ENTRY"
+                    "ENTRY TIMEOUT: cancel failed; "
+                    "keeping PENDING_ENTRY"
                 )
 
             return state, True
 
-    # Actual Webull position exists: this is the authoritative fill.
+    # Actual Webull position is authoritative.
     if pos and (pos.get("quantity") or 0) > 0:
-        actual_qty = int(pos["quantity"])
-        actual_entry = filled_price or pos.get("cost_price")
+
+        actual_qty = int(
+            pos["quantity"]
+        )
+
+        actual_entry = (
+            filled_price
+            or pos.get("cost_price")
+        )
 
         state["position"].update({
             "quantity": actual_qty,
@@ -257,35 +313,49 @@ def entry_fill_state(trade, state):
         state["state"] = "OPEN"
 
         log.info(
-            "STATE PENDING_ENTRY -> OPEN: actual_qty=%s "
-            "entry_premium=%s order_status=%s",
+            "STATE PENDING_ENTRY -> OPEN: "
+            "actual_qty=%s entry_premium=%s "
+            "order_status=%s",
             actual_qty,
             actual_entry,
             detail.get("status"),
         )
 
-        # Partial fill: cancel the remainder so we do not accidentally
-        # acquire additional contracts later.
+        # Partial fill:
+        # cancel any remaining quantity.
         if (
             status_class == "PARTIAL_FILLED"
-            and filled_qty < (detail.get("total_qty") or filled_qty)
+            and filled_qty
+            < (detail.get("total_qty") or filled_qty)
         ):
+
             try:
-                cancel = wb.cancel_order(trade, cid)
+                cancel = wb.cancel_order(
+                    trade,
+                    cid,
+                )
+
                 log.info(
                     "ENTRY PARTIAL: cancel remainder result=%s",
                     cancel,
                 )
+
             except Exception:
                 log.exception(
-                    "ENTRY PARTIAL: failed to cancel unfilled remainder"
+                    "ENTRY PARTIAL: failed to cancel "
+                    "unfilled remainder"
                 )
 
         return state, True
 
-    if status_class in ("REJECTED", "CANCELED"):
+    if status_class in (
+        "REJECTED",
+        "CANCELED",
+    ):
+
         log.warning(
-            "ENTRY FINAL WITHOUT POSITION: status=%s filled_qty=%s",
+            "ENTRY FINAL WITHOUT POSITION: "
+            "status=%s filled_qty=%s",
             detail.get("status"),
             filled_qty,
         )
@@ -293,6 +363,7 @@ def entry_fill_state(trade, state):
         state["state"] = "FLAT"
         state["position"] = None
         state["entry_order"] = None
+
         state["last_error"] = (
             f"Entry order ended {detail.get('status')} "
             "without a Webull position"
@@ -300,13 +371,15 @@ def entry_fill_state(trade, state):
 
         return state, True
 
-    # Even if the order reports FILLED, do not trust that alone.
-    # The position endpoint must confirm the actual position.
+    # Even a FILLED order is not enough.
+    # Wait for the actual position endpoint.
     if status_class == "FILLED":
+
         state["state"] = "PENDING_ENTRY"
+
         state["last_error"] = (
-            "Order reports FILLED but matching Webull position "
-            "is not yet visible"
+            "Order reports FILLED but matching Webull "
+            "position is not yet visible"
         )
 
         log.warning(
@@ -319,14 +392,23 @@ def entry_fill_state(trade, state):
     return state, False
 
 
+# ============================================================
+# EXIT RECONCILIATION
+# ============================================================
+
+
 def reconcile_exit(trade, state):
+
     order = state.get("exit_order") or {}
     cid = order.get("client_order_id")
 
     if not cid:
         return state, False
 
-    detail = wb.order_detail(trade, cid)
+    detail = wb.order_detail(
+        trade,
+        cid,
+    )
 
     order.update({
         "status": detail.get("status"),
@@ -340,10 +422,12 @@ def reconcile_exit(trade, state):
     position_result = wb.positions(trade)
 
     if not position_result.get("success"):
+
         log.warning(
             "EXIT RECONCILE: position query failed; "
             "retaining PENDING_EXIT"
         )
+
         return state, False
 
     pos = wb.find_matching_option_position(
@@ -353,28 +437,41 @@ def reconcile_exit(trade, state):
     ) if state.get("position") else None
 
     if isinstance(pos, dict) and pos.get("ambiguous"):
+
         state["state"] = "RECOVERY_REQUIRED"
+
         state["last_error"] = (
-            "Multiple matching positions after exit; refusing to guess"
+            "Multiple matching positions after exit; "
+            "refusing to guess"
         )
+
         return state, True
 
-    remaining = int(pos.get("quantity") or 0) if pos else 0
-    filled_qty = int(detail.get("filled_qty") or 0)
-    status_class = detail.get("status_class")
+    remaining = (
+        int(pos.get("quantity") or 0)
+        if pos
+        else 0
+    )
 
-    # AUTHORITATIVE EXIT CONFIRMATION:
-    # If Webull says the position is gone, we are FLAT regardless
-    # of what the order detail currently reports.
+    filled_qty = int(
+        detail.get("filled_qty") or 0
+    )
+
+    status_class = detail.get(
+        "status_class"
+    )
+
+    # Webull position is authoritative.
     if remaining == 0:
+
         state["state"] = "FLAT"
         state["position"] = None
         state["exit_order"] = None
         state["last_trade"] = time.time()
 
         log.info(
-            "STATE PENDING_EXIT -> FLAT: exit_fill_qty=%s "
-            "exit_avg=%s status=%s",
+            "STATE PENDING_EXIT -> FLAT: "
+            "exit_fill_qty=%s exit_avg=%s status=%s",
             filled_qty,
             detail.get("filled_price"),
             detail.get("status"),
@@ -382,55 +479,69 @@ def reconcile_exit(trade, state):
 
         return state, True
 
-    # Rejected/canceled exit with a position still present.
-    if status_class in ("REJECTED", "CANCELED"):
+    if status_class in (
+        "REJECTED",
+        "CANCELED",
+    ):
+
         state["position"]["quantity"] = remaining
         state["state"] = "OPEN"
         state["exit_order"] = None
+
         state["last_error"] = (
             f"Exit order ended {detail.get('status')} "
             f"with {remaining} contracts remaining"
         )
 
         log.warning(
-            "STATE PENDING_EXIT -> OPEN: remaining=%s status=%s",
+            "STATE PENDING_EXIT -> OPEN: "
+            "remaining=%s status=%s",
             remaining,
             detail.get("status"),
         )
 
         return state, True
 
-    # Partial exit: keep managing only what remains.
     state["position"]["quantity"] = remaining
 
     return state, False
 
 
+# ============================================================
+# STARTUP RECOVERY
+# ============================================================
+
+
 def recover_from_webull(trade, state):
-    """
-    On startup, prefer actual Webull state and safely unwind stale
-    entry orders.
-    """
+
     result = wb.positions(trade)
 
     if not result.get("success"):
+
         log.error(
             "STARTUP RECOVERY: cannot query Webull positions; "
             "trading is halted"
         )
 
         state["state"] = "RECOVERY_REQUIRED"
+
         state["last_error"] = (
             "Webull position query failed during startup recovery"
         )
 
         return state
 
-    items = wb._position_items(result.get("positions"))
+    items = wb._position_items(
+        result.get("positions")
+    )
+
     option_positions = []
 
     for raw in items:
-        p = wb.normalize_position(raw)
+
+        p = wb.normalize_position(
+            raw
+        )
 
         if (
             p.get("instrument_type") == "OPTION"
@@ -439,53 +550,78 @@ def recover_from_webull(trade, state):
             option_positions.append(p)
 
     if not option_positions:
-        # A local PENDING_ENTRY may still have a live Webull order.
-        # Never simply erase that state.
+
         if (
             state.get("state") == "PENDING_ENTRY"
-            and state.get("entry_order", {}).get("client_order_id")
+            and state.get("entry_order", {}).get(
+                "client_order_id"
+            )
         ):
-            cid = state["entry_order"]["client_order_id"]
+
+            cid = state["entry_order"][
+                "client_order_id"
+            ]
 
             try:
-                detail = wb.order_detail(trade, cid)
 
-                if detail.get("status_class") == "PENDING":
-                    cancel = wb.cancel_order(trade, cid)
+                detail = wb.order_detail(
+                    trade,
+                    cid,
+                )
+
+                if detail.get(
+                    "status_class"
+                ) == "PENDING":
+
+                    cancel = wb.cancel_order(
+                        trade,
+                        cid,
+                    )
 
                     log.warning(
-                        "STARTUP RECOVERY: canceled stale pending "
-                        "entry %s -> %s",
+                        "STARTUP RECOVERY: canceled stale "
+                        "pending entry %s -> %s",
                         cid,
                         cancel,
                     )
 
-                elif detail.get("status_class") == "FILLED":
+                elif detail.get(
+                    "status_class"
+                ) == "FILLED":
+
                     state["last_error"] = (
-                        "Entry order reports FILLED but no position "
-                        "is visible yet"
+                        "Entry order reports FILLED but no "
+                        "position is visible yet"
                     )
+
                     state["state"] = "PENDING_ENTRY"
+
                     return state
 
             except Exception:
+
                 log.exception(
-                    "STARTUP RECOVERY: could not safely inspect/"
-                    "cancel pending entry"
+                    "STARTUP RECOVERY: could not safely "
+                    "inspect/cancel pending entry"
                 )
 
                 state["state"] = "RECOVERY_REQUIRED"
+
                 state["last_error"] = (
-                    "Could not reconcile pending entry order after restart"
+                    "Could not reconcile pending entry "
+                    "order after restart"
                 )
 
                 return state
 
-        if state.get("state") in ("OPEN", "PENDING_EXIT"):
+        if state.get("state") in (
+            "OPEN",
+            "PENDING_EXIT",
+        ):
+
             log.warning(
-                "STARTUP RECOVERY: local active state but Webull "
-                "has no option position; clearing after successful "
-                "position query"
+                "STARTUP RECOVERY: local active state but "
+                "Webull has no option position; clearing"
             )
 
         state["state"] = "FLAT"
@@ -496,9 +632,12 @@ def recover_from_webull(trade, state):
         return state
 
     if len(option_positions) > 1:
+
         state["state"] = "RECOVERY_REQUIRED"
+
         state["last_error"] = (
-            "More than one open option position exists in Webull Sandbox"
+            "More than one open option position exists "
+            "in Webull Sandbox"
         )
 
         log.error(
@@ -509,10 +648,17 @@ def recover_from_webull(trade, state):
         return state
 
     p = option_positions[0]
-    old = state.get("position") or {}
-    contract = old.get("contract")
+
+    old = state.get(
+        "position"
+    ) or {}
+
+    contract = old.get(
+        "contract"
+    )
 
     if not contract:
+
         contract = {
             "symbol": None,
             "strike_price": p.get("strike"),
@@ -523,14 +669,30 @@ def recover_from_webull(trade, state):
     state["position"] = {
         **old,
         "side": p.get("option_type"),
-        "symbol": contract.get("symbol") or p.get("symbol"),
+        "symbol": (
+            contract.get("symbol")
+            or p.get("symbol")
+        ),
         "contract": contract,
-        "quantity": int(p.get("quantity") or 0),
-        "entry_premium": old.get("entry_premium") or p.get("cost_price"),
-        "entry_underlying": old.get("entry_underlying"),
-        "entry_atr": old.get("entry_atr"),
-        "entry_time": old.get("entry_time")
-        or datetime.now(timezone.utc).isoformat(),
+        "quantity": int(
+            p.get("quantity") or 0
+        ),
+        "entry_premium": (
+            old.get("entry_premium")
+            or p.get("cost_price")
+        ),
+        "entry_underlying": old.get(
+            "entry_underlying"
+        ),
+        "entry_atr": old.get(
+            "entry_atr"
+        ),
+        "entry_time": (
+            old.get("entry_time")
+            or datetime.now(
+                timezone.utc
+            ).isoformat()
+        ),
     }
 
     if state["state"] != "PENDING_EXIT":
@@ -549,35 +711,53 @@ def recover_from_webull(trade, state):
     return state
 
 
-def retry_stale_exit(trade, data, state):
-    """
-    Cancel/reprice a working exit after a short timeout,
-    bounded by MAX_EXIT_RETRIES.
+# ============================================================
+# STALE EXIT RETRY
+# ============================================================
 
-    Every retry uses the CURRENT BID and submits a new limit price
-    EXIT_PRICE_OFFSET below that bid.
-    """
-    order = state.get("exit_order") or {}
-    submitted = order.get("submitted_at")
+
+def retry_stale_exit(trade, data, state):
+
+    order = state.get(
+        "exit_order"
+    ) or {}
+
+    submitted = order.get(
+        "submitted_at"
+    )
 
     if not submitted:
         return state
 
     try:
+
         age = (
             datetime.now(timezone.utc)
-            - datetime.fromisoformat(submitted).astimezone(timezone.utc)
+            - datetime.fromisoformat(
+                submitted
+            ).astimezone(
+                timezone.utc
+            )
         ).total_seconds()
-    except (TypeError, ValueError):
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
         age = 0
 
     if age < config.EXIT_ORDER_TIMEOUT_SECONDS:
         return state
 
-    retries = int(order.get("retries") or 0)
+    retries = int(
+        order.get("retries") or 0
+    )
 
     if retries >= config.MAX_EXIT_RETRIES:
+
         state["state"] = "RECOVERY_REQUIRED"
+
         state["last_error"] = (
             "Exit remained unresolved after maximum retries"
         )
@@ -589,11 +769,18 @@ def retry_stale_exit(trade, data, state):
 
         return state
 
-    cid = order.get("client_order_id")
+    cid = order.get(
+        "client_order_id"
+    )
 
     if cid:
+
         try:
-            cancel = wb.cancel_order(trade, cid)
+
+            cancel = wb.cancel_order(
+                trade,
+                cid,
+            )
 
             log.warning(
                 "EXIT RETRY: cancel %s -> %s",
@@ -602,25 +789,32 @@ def retry_stale_exit(trade, data, state):
             )
 
         except Exception:
+
             log.exception(
                 "EXIT RETRY: cancel failed; "
-                "will re-check position before retry"
+                "will re-check position"
             )
 
             return state
 
-    # IMPORTANT:
-    # Never submit another SELL until the position is re-verified.
-    pos_result = wb.positions(trade)
+    # Verify position again before another SELL.
+    pos_result = wb.positions(
+        trade
+    )
 
-    if not pos_result.get("success"):
+    if not pos_result.get(
+        "success"
+    ):
+
         log.warning(
-            "EXIT RETRY: unable to verify position; "
-            "will retry verification"
+            "EXIT RETRY: unable to verify position"
         )
+
         return state
 
-    pos = state.get("position") or {}
+    pos = state.get(
+        "position"
+    ) or {}
 
     actual = wb.find_matching_option_position(
         pos_result.get("positions"),
@@ -628,41 +822,59 @@ def retry_stale_exit(trade, data, state):
         pos.get("side"),
     )
 
-    if not actual or actual.get("ambiguous"):
+    if not actual or actual.get(
+        "ambiguous"
+    ):
+
         state["state"] = "RECOVERY_REQUIRED"
+
         state["last_error"] = (
-            "Could not uniquely verify remaining position "
-            "before exit retry"
+            "Could not uniquely verify remaining "
+            "position before exit retry"
         )
+
         return state
 
-    remaining = int(actual.get("quantity") or 0)
+    remaining = int(
+        actual.get("quantity") or 0
+    )
 
     if remaining <= 0:
+
         state["state"] = "FLAT"
         state["position"] = None
         state["exit_order"] = None
+
         return state
 
-    quote = wb.option_quote(data, pos["symbol"])
+    quote = wb.option_quote(
+        data,
+        pos["symbol"],
+    )
 
-    bid = quote.get("bid")
+    bid = quote.get(
+        "bid"
+    )
 
     if bid is None or bid <= 0:
+
         log.warning(
             "EXIT RETRY: no valid bid for %s",
             pos["symbol"],
         )
+
         return state
 
-    price = aggressive_exit_price(bid)
+    price = aggressive_exit_price(
+        bid
+    )
 
     if price is None:
         return state
 
     log.warning(
-        "EXIT RETRY PRICING: bid=%.2f -> limit=%.2f "
-        "(%.2f below bid)",
+        "EXIT RETRY PRICING: bid=%.2f -> "
+        "limit=%.2f (%.2f below bid)",
         bid,
         price,
         EXIT_PRICE_OFFSET,
@@ -675,25 +887,46 @@ def retry_stale_exit(trade, data, state):
         price,
     )
 
-    if not result.get("success"):
+    if not result.get(
+        "success"
+    ):
+
         log.error(
             "EXIT RETRY REJECTED: %s",
             result,
         )
 
-        order["retries"] = retries + 1
-        order["last_retry_error"] = str(result)
-        order["submitted_at"] = datetime.now(timezone.utc).isoformat()
+        order["retries"] = (
+            retries + 1
+        )
+
+        order["last_retry_error"] = str(
+            result
+        )
+
+        order["submitted_at"] = (
+            datetime.now(
+                timezone.utc
+            ).isoformat()
+        )
 
         return state
 
     state["exit_order"] = {
         **order,
-        "client_order_id": result.get("client_order_id"),
-        "status": result.get("status"),
-        "status_class": result.get("status_class"),
+        "client_order_id": result.get(
+            "client_order_id"
+        ),
+        "status": result.get(
+            "status"
+        ),
+        "status_class": result.get(
+            "status_class"
+        ),
         "requested_qty": remaining,
-        "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "submitted_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
         "retries": retries + 1,
         "bid_at_submission": bid,
         "limit_price": price,
@@ -703,7 +936,9 @@ def retry_stale_exit(trade, data, state):
         "EXIT RETRY %s: new order=%s qty=%s "
         "bid=%.2f limit=%.2f",
         retries + 1,
-        result.get("client_order_id"),
+        result.get(
+            "client_order_id"
+        ),
         remaining,
         bid,
         price,
@@ -712,160 +947,249 @@ def retry_stale_exit(trade, data, state):
     return state
 
 
-def risk_reason(pos, signal_snapshot, option_quote, dt):
-    """Return the highest-priority exit reason, or None."""
+# ============================================================
+# RISK ENGINE
+# ============================================================
+
+
+def risk_reason(
+    pos,
+    signal_snapshot,
+    option_quote,
+    dt,
+):
+    """
+    Return highest-priority exit reason.
+    """
+
     if force_exit_due(dt):
         return "FORCED_EOD_LIQUIDATION"
 
-    if position_age_seconds(pos) >= config.MAX_HOLD_MINUTES * 60:
+    if (
+        position_age_seconds(pos)
+        >= config.MAX_HOLD_MINUTES * 60
+    ):
         return "TIME_STOP"
 
-    premium = option_quote.get("bid")
-    entry = pos.get("entry_premium")
+    premium = option_quote.get(
+        "bid"
+    )
+
+    entry = pos.get(
+        "entry_premium"
+    )
 
     if (
         config.USE_OPTION_PREMIUM_RISK
         and premium is not None
         and entry
     ):
-        change = premium / entry - 1.0
 
-        if change <= -config.OPTION_STOP_LOSS_PCT:
+        change = (
+            premium / entry
+            - 1.0
+        )
+
+        if (
+            change
+            <= -config.OPTION_STOP_LOSS_PCT
+        ):
             return "OPTION_MAX_LOSS"
 
-        if change >= config.OPTION_TAKE_PROFIT_PCT:
+        if (
+            change
+            >= config.OPTION_TAKE_PROFIT_PCT
+        ):
             return "OPTION_TAKE_PROFIT"
 
         if (
             config.USE_BE
-            and change >= config.OPTION_BREAKEVEN_TRIGGER_PCT
+            and change
+            >= config.OPTION_BREAKEVEN_TRIGGER_PCT
         ):
-            pos["option_breakeven_armed"] = True
+            pos[
+                "option_breakeven_armed"
+            ] = True
 
         if (
-            pos.get("option_breakeven_armed")
-            and change <= config.OPTION_BREAKEVEN_FLOOR_PCT
+            pos.get(
+                "option_breakeven_armed"
+            )
+            and change
+            <= config.OPTION_BREAKEVEN_FLOOR_PCT
         ):
             return "OPTION_BREAKEVEN"
 
     if (
-        signal_snapshot.get("atr") is not None
-        and pos.get("entry_underlying") is not None
+        signal_snapshot.get("atr")
+        is not None
+        and pos.get(
+            "entry_underlying"
+        )
+        is not None
     ):
-        stop, target, be = levels(pos)
+
+        stop, target, be = levels(
+            pos
+        )
 
         if (
             config.USE_BE
             and pos.get("side") == "CALL"
             and signal_snapshot["close"] >= be
         ):
-            stop = max(stop, pos["entry_underlying"])
+            stop = max(
+                stop,
+                pos["entry_underlying"],
+            )
 
         if (
             config.USE_BE
             and pos.get("side") == "PUT"
             and signal_snapshot["close"] <= be
         ):
-            stop = min(stop, pos["entry_underlying"])
+            stop = min(
+                stop,
+                pos["entry_underlying"],
+            )
 
-        if pos.get("side") == "CALL":
-            if signal_snapshot["close"] <= stop:
+        if pos.get(
+            "side"
+        ) == "CALL":
+
+            if (
+                signal_snapshot["close"]
+                <= stop
+            ):
                 return "UNDERLYING_STOP"
 
-            if signal_snapshot["close"] >= target:
+            if (
+                signal_snapshot["close"]
+                >= target
+            ):
                 return "UNDERLYING_TARGET"
 
             if (
                 config.USE_ZONE
-                and signal_snapshot.get("upper") is not None
-                and signal_snapshot["close"] >= signal_snapshot["upper"]
+                and signal_snapshot.get(
+                    "upper"
+                ) is not None
+                and signal_snapshot["close"]
+                >= signal_snapshot["upper"]
             ):
                 return "WAVE_ZONE"
 
         else:
-            if signal_snapshot["close"] >= stop:
+
+            if (
+                signal_snapshot["close"]
+                >= stop
+            ):
                 return "UNDERLYING_STOP"
 
-            if signal_snapshot["close"] <= target:
+            if (
+                signal_snapshot["close"]
+                <= target
+            ):
                 return "UNDERLYING_TARGET"
 
             if (
                 config.USE_ZONE
-                and signal_snapshot.get("lower") is not None
-                and signal_snapshot["close"] <= signal_snapshot["lower"]
+                and signal_snapshot.get(
+                    "lower"
+                ) is not None
+                and signal_snapshot["close"]
+                <= signal_snapshot["lower"]
             ):
                 return "WAVE_ZONE"
 
     return None
 
 
-def submit_exit(trade, data, state, reason):
-    pos = state.get("position") or {}
+# ============================================================
+# EXIT SUBMISSION
+# ============================================================
 
-    quantity = int(pos.get("quantity") or 0)
+
+def submit_exit(
+    trade,
+    data,
+    state,
+    reason,
+):
+
+    pos = state.get(
+        "position"
+    ) or {}
+
+    quantity = int(
+        pos.get("quantity") or 0
+    )
 
     if quantity <= 0:
         raise RuntimeError(
             "Cannot exit: actual position quantity is zero"
         )
 
-    # ========================================================
-    # FINAL POSITION VERIFICATION BEFORE SELL
-    # ========================================================
-    positions_result = wb.positions(trade)
+    # Verify actual position immediately before SELL.
+    positions_result = wb.positions(
+        trade
+    )
 
-    if not positions_result.get("success"):
+    if not positions_result.get(
+        "success"
+    ):
         raise RuntimeError(
             "Cannot verify Webull position before exit"
         )
 
     actual = wb.find_matching_option_position(
-        positions_result.get("positions"),
-        pos.get("contract") or {},
-        pos.get("side"),
+        positions_result.get(
+            "positions"
+        ),
+        pos.get(
+            "contract"
+        ) or {},
+        pos.get(
+            "side"
+        ),
     )
 
-    if not actual or actual.get("ambiguous"):
+    if not actual or actual.get(
+        "ambiguous"
+    ):
         raise RuntimeError(
             "Cannot uniquely verify Webull position before exit"
         )
 
-    quantity = int(actual.get("quantity") or 0)
+    quantity = int(
+        actual.get("quantity") or 0
+    )
 
     if quantity <= 0:
         raise RuntimeError(
             "Webull position disappeared before exit submission"
         )
 
-    # ========================================================
-    # GET LIVE QUOTE
-    # ========================================================
+    # Get LIVE option quote.
     quote = wb.option_quote(
         data,
         pos["symbol"],
     )
 
-    bid = quote.get("bid")
+    bid = quote.get(
+        "bid"
+    )
 
     if bid is None or bid <= 0:
         raise RuntimeError(
             "No valid option bid available for exit"
         )
 
-    # ========================================================
-    # AGGRESSIVE EXIT PRICE
-    # ========================================================
-    #
-    # Sell BELOW the bid, not AT the bid.
-    #
-    # Example:
-    #   bid = 0.62
-    #   exit = 0.59
-    #
-    # This makes the limit order immediately marketable while
-    # retaining a limit price.
-    # ========================================================
-    price = aggressive_exit_price(bid)
+    # Sell below bid.
+    price = aggressive_exit_price(
+        bid
+    )
 
     if price is None:
         raise RuntimeError(
@@ -873,8 +1197,8 @@ def submit_exit(trade, data, state, reason):
         )
 
     log.warning(
-        "EXIT PRICING: reason=%s symbol=%s qty=%s "
-        "bid=%.2f -> limit=%.2f",
+        "EXIT PRICING: reason=%s symbol=%s "
+        "qty=%s bid=%.2f -> limit=%.2f",
         reason,
         pos["symbol"],
         quantity,
@@ -890,9 +1214,10 @@ def submit_exit(trade, data, state, reason):
     )
 
     if config.DRY_RUN:
+
         log.info(
-            "DRY_RUN EXIT reason=%s symbol=%s qty=%s "
-            "bid=%.2f limit=%.2f",
+            "DRY_RUN EXIT: reason=%s symbol=%s "
+            "qty=%s bid=%.2f limit=%.2f",
             reason,
             pos["symbol"],
             quantity,
@@ -907,7 +1232,9 @@ def submit_exit(trade, data, state, reason):
 
         return state
 
-    if not result.get("success"):
+    if not result.get(
+        "success"
+    ):
         raise RuntimeError(
             f"Webull exit was not accepted: {result}"
         )
@@ -915,26 +1242,43 @@ def submit_exit(trade, data, state, reason):
     state["state"] = "PENDING_EXIT"
 
     state["exit_order"] = {
-        "client_order_id": result.get("client_order_id"),
-        "status": result.get("status"),
-        "status_class": result.get("status_class"),
+        "client_order_id": result.get(
+            "client_order_id"
+        ),
+        "status": result.get(
+            "status"
+        ),
+        "status_class": result.get(
+            "status_class"
+        ),
         "requested_qty": quantity,
         "reason": reason,
-        "submitted_at": datetime.now(timezone.utc).isoformat(),
-        "filled_qty": result.get("filled_qty") or 0,
-        "filled_price": result.get("filled_price"),
+        "submitted_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "filled_qty": result.get(
+            "filled_qty"
+        ) or 0,
+        "filled_price": result.get(
+            "filled_price"
+        ),
         "bid_at_submission": bid,
         "limit_price": price,
         "retries": 0,
     }
 
     log.info(
-        "STATE OPEN -> PENDING_EXIT reason=%s qty=%s "
-        "order=%s status=%s bid=%.2f limit=%.2f",
+        "STATE OPEN -> PENDING_EXIT "
+        "reason=%s qty=%s order=%s status=%s "
+        "bid=%.2f limit=%.2f",
         reason,
         quantity,
-        result.get("client_order_id"),
-        result.get("status"),
+        result.get(
+            "client_order_id"
+        ),
+        result.get(
+            "status"
+        ),
         bid,
         price,
     )
@@ -942,20 +1286,50 @@ def submit_exit(trade, data, state, reason):
     return state
 
 
-def maybe_enter(trade, data, state, snapshot):
-    if not snapshot.get("signal") or not new_entries_allowed():
+# ============================================================
+# INTRABAR ENTRY ENGINE
+# ============================================================
+
+
+def maybe_enter(
+    trade,
+    data,
+    state,
+    snapshot,
+):
+
+    if (
+        not snapshot.get("signal")
+        or not new_entries_allowed()
+    ):
         return state
 
-    if state.get("state") != "FLAT":
+    if state.get(
+        "state"
+    ) != "FLAT":
         return state
 
-    if time.time() - state.get("last_trade", 0) < config.COOLDOWN:
+    if (
+        time.time()
+        - state.get(
+            "last_trade",
+            0,
+        )
+        < config.COOLDOWN
+    ):
         return state
 
-    if snapshot.get("bar_time") == state.get("last_signal_bar"):
+    if (
+        snapshot.get("bar_time")
+        == state.get(
+            "last_signal_bar"
+        )
+    ):
         return state
 
-    option_type = snapshot["signal"]
+    option_type = snapshot[
+        "signal"
+    ]
 
     contract = wb.choose(
         data,
@@ -963,24 +1337,39 @@ def maybe_enter(trade, data, state, snapshot):
         snapshot["close"],
     )
 
-    symbol = contract.get("symbol")
+    symbol = contract.get(
+        "symbol"
+    )
 
     quote = wb.option_quote(
         data,
         symbol,
     )
 
-    bid = quote.get("bid")
-    ask = quote.get("ask")
+    bid = quote.get(
+        "bid"
+    )
 
-    if bid is None or ask is None or ask <= 0:
+    ask = quote.get(
+        "ask"
+    )
+
+    if (
+        bid is None
+        or ask is None
+        or ask <= 0
+    ):
+
         log.info(
             "ENTRY SKIP: no bid/ask for %s",
             symbol,
         )
+
         return state
 
-    mid = (bid + ask) / 2
+    mid = (
+        bid + ask
+    ) / 2
 
     spread = (
         (ask - bid) / mid
@@ -992,42 +1381,53 @@ def maybe_enter(trade, data, state, snapshot):
         config.MIN_PREMIUM
         <= mid
         <= config.MAX_PREMIUM
-        and spread <= config.MAX_SPREAD
+        and spread
+        <= config.MAX_SPREAD
     ):
+
         log.info(
-            "ENTRY SKIP: %s premium=%.2f spread=%.1f%%",
+            "ENTRY SKIP: %s premium=%.2f "
+            "spread=%.1f%%",
             symbol,
             mid,
             spread * 100,
         )
+
         return state
 
     # ========================================================
-    # AGGRESSIVE ENTRY PRICE
+    # AGGRESSIVE ENTRY
     # ========================================================
     #
-    # Buy slightly ABOVE the ask.
+    # Buy ABOVE ask.
     #
     # Example:
-    #   ask = 0.70
-    #   entry limit = 0.72
+    # ask = 0.70
+    # limit = 0.72
     #
-    # This gives the order room to fill if the option is moving
-    # quickly upward.
+    # This is intentionally aggressive.
     # ========================================================
-    entry_price = aggressive_entry_price(ask)
+
+    entry_price = aggressive_entry_price(
+        ask
+    )
 
     if entry_price is None:
+
         log.info(
             "ENTRY SKIP: invalid ask for %s",
             symbol,
         )
+
         return state
 
     log.info(
-        "ENTRY PRICING: %s bid=%.2f ask=%.2f "
-        "-> limit=%.2f (+%.2f)",
+        "INTRABAR ENTRY SIGNAL: %s %s "
+        "SPY=%.2f bid=%.2f ask=%.2f "
+        "limit=%.2f (+%.2f)",
+        option_type,
         symbol,
+        snapshot["close"],
         bid,
         ask,
         entry_price,
@@ -1041,24 +1441,35 @@ def maybe_enter(trade, data, state, snapshot):
         entry_price,
     )
 
-    if not result.get("success"):
+    if not result.get(
+        "success"
+    ):
+
         log.error(
             "ENTRY REJECTED: %s",
             result,
         )
 
-        state["last_error"] = str(result)
+        state["last_error"] = str(
+            result
+        )
 
         return state
 
-    state["last_signal_bar"] = snapshot["bar_time"]
+    # Prevent duplicate entry signals
+    # from the same 5-minute bucket.
+    state["last_signal_bar"] = (
+        snapshot["bar_time"]
+    )
 
     if config.DRY_RUN:
-        # DRY_RUN models the accepted strategy fill locally.
+
         state["state"] = "OPEN"
 
         state["entry_order"] = {
-            "client_order_id": result.get("client_order_id"),
+            "client_order_id": result.get(
+                "client_order_id"
+            ),
             "status": "DRY_RUN_FILLED",
             "status_class": "FILLED",
             "requested_qty": config.OPTION_QUANTITY,
@@ -1072,15 +1483,21 @@ def maybe_enter(trade, data, state, snapshot):
             "symbol": symbol,
             "contract": contract,
             "quantity": config.OPTION_QUANTITY,
-            "entry_underlying": snapshot["close"],
-            "entry_atr": snapshot["atr"],
+            "entry_underlying": snapshot[
+                "close"
+            ],
+            "entry_atr": snapshot[
+                "atr"
+            ],
             "entry_premium": entry_price,
-            "entry_time": datetime.now(timezone.utc).isoformat(),
+            "entry_time": datetime.now(
+                timezone.utc
+            ).isoformat(),
             "option_breakeven_armed": False,
         }
 
         log.info(
-            "DRY_RUN ENTRY FILLED (SIMULATED): "
+            "DRY_RUN INTRABAR ENTRY FILLED: "
             "%s %s qty=%s ask=%.2f limit=%.2f",
             option_type,
             symbol,
@@ -1094,13 +1511,25 @@ def maybe_enter(trade, data, state, snapshot):
     state["state"] = "PENDING_ENTRY"
 
     state["entry_order"] = {
-        "client_order_id": result.get("client_order_id"),
-        "status": result.get("status"),
-        "status_class": result.get("status_class"),
+        "client_order_id": result.get(
+            "client_order_id"
+        ),
+        "status": result.get(
+            "status"
+        ),
+        "status_class": result.get(
+            "status_class"
+        ),
         "requested_qty": config.OPTION_QUANTITY,
-        "submitted_at": datetime.now(timezone.utc).isoformat(),
-        "filled_qty": result.get("filled_qty") or 0,
-        "filled_price": result.get("filled_price"),
+        "submitted_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "filled_qty": result.get(
+            "filled_qty"
+        ) or 0,
+        "filled_price": result.get(
+            "filled_price"
+        ),
         "ask_at_submission": ask,
         "limit_price": entry_price,
     }
@@ -1110,20 +1539,29 @@ def maybe_enter(trade, data, state, snapshot):
         "symbol": symbol,
         "contract": contract,
         "quantity": 0,
-        "entry_underlying": snapshot["close"],
-        "entry_atr": snapshot["atr"],
+        "entry_underlying": snapshot[
+            "close"
+        ],
+        "entry_atr": snapshot[
+            "atr"
+        ],
         "entry_premium": None,
-        "entry_time": datetime.now(timezone.utc).isoformat(),
+        "entry_time": datetime.now(
+            timezone.utc
+        ).isoformat(),
         "option_breakeven_armed": False,
     }
 
     log.info(
-        "ENTRY SUBMITTED: %s %s qty=%s order=%s "
+        "INTRABAR ENTRY SUBMITTED: "
+        "%s %s qty=%s order=%s "
         "ask=%.2f limit=%.2f",
         option_type,
         symbol,
         config.OPTION_QUANTITY,
-        result.get("client_order_id"),
+        result.get(
+            "client_order_id"
+        ),
         ask,
         entry_price,
     )
@@ -1131,7 +1569,13 @@ def maybe_enter(trade, data, state, snapshot):
     return state
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
+
 def main():
+
     global running
 
     trade, data = wb.connect()
@@ -1144,8 +1588,10 @@ def main():
     save(state)
 
     log.info(
-        "Connected to Webull SANDBOX. DRY_RUN=%s state=%s "
-        "ENTRY_OFFSET=%.2f EXIT_OFFSET=%.2f",
+        "Connected to Webull SANDBOX. "
+        "DRY_RUN=%s state=%s "
+        "ENTRY_OFFSET=%.2f EXIT_OFFSET=%.2f "
+        "ENTRY_MODE=INTRABAR",
         config.DRY_RUN,
         state.get("state"),
         ENTRY_PRICE_OFFSET,
@@ -1153,11 +1599,17 @@ def main():
     )
 
     while running:
+
         try:
+
             # ====================================================
             # PENDING ENTRY
             # ====================================================
-            if state.get("state") == "PENDING_ENTRY":
+
+            if state.get(
+                "state"
+            ) == "PENDING_ENTRY":
+
                 state, _ = entry_fill_state(
                     trade,
                     state,
@@ -1165,22 +1617,33 @@ def main():
 
                 save(state)
 
-                if state.get("state") == "PENDING_ENTRY":
+                if state.get(
+                    "state"
+                ) == "PENDING_ENTRY":
+
                     time.sleep(
                         config.RECOVERY_POLL_SECONDS
                     )
+
                     continue
 
             # ====================================================
             # PENDING EXIT
             # ====================================================
-            if state.get("state") == "PENDING_EXIT":
+
+            if state.get(
+                "state"
+            ) == "PENDING_EXIT":
+
                 state, _ = reconcile_exit(
                     trade,
                     state,
                 )
 
-                if state.get("state") == "PENDING_EXIT":
+                if state.get(
+                    "state"
+                ) == "PENDING_EXIT":
+
                     state = retry_stale_exit(
                         trade,
                         data,
@@ -1189,19 +1652,29 @@ def main():
 
                 save(state)
 
-                if state.get("state") == "PENDING_EXIT":
+                if state.get(
+                    "state"
+                ) == "PENDING_EXIT":
+
                     time.sleep(
                         config.RECOVERY_POLL_SECONDS
                     )
+
                     continue
 
             # ====================================================
             # RECOVERY REQUIRED
             # ====================================================
-            if state.get("state") == "RECOVERY_REQUIRED":
+
+            if state.get(
+                "state"
+            ) == "RECOVERY_REQUIRED":
+
                 log.error(
                     "RECOVERY_REQUIRED: %s",
-                    state.get("last_error"),
+                    state.get(
+                        "last_error"
+                    ),
                 )
 
                 time.sleep(
@@ -1220,6 +1693,7 @@ def main():
             # ====================================================
             # MARKET DATA
             # ====================================================
+
             raw = wb.bars(
                 data,
                 config.HISTORY_COUNT,
@@ -1231,56 +1705,110 @@ def main():
             ]
 
             if len(bs) < 60:
+
                 raise RuntimeError(
                     f"Only {len(bs)} usable bars returned"
                 )
 
-            # Entry engine uses completed 5-minute bars.
-            # Exit engine checks live option quotes every cycle.
-            s = analyze(bs[:-1])
+            # ====================================================
+            # IMPORTANT:
+            #
+            # DO NOT use bs[:-1].
+            #
+            # The last bar is the CURRENT, IN-PROGRESS
+            # 5-minute bucket.
+            #
+            # The Pine strategy evaluates its indicators
+            # intrabar using the current realtime price.
+            #
+            # Therefore the current bar MUST be passed into
+            # analyze() so a SuperTrend flip can trigger
+            # immediately when the indicator condition occurs.
+            # ====================================================
+
+            s = analyze(bs)
 
             log.info(
-                "SPY %.2f trend=%s signal=%s ATR=%s "
-                "ADX=%s compressed=%s",
+                "SPY %.2f trend=%s signal=%s "
+                "ATR=%s ADX=%s compressed=%s "
+                "bar=%s INTRABAR",
                 s["close"],
-                "UP" if s["trend"] == 1 else "DOWN",
+                "UP"
+                if s["trend"] == 1
+                else "DOWN",
                 s["signal"] or "-",
-                f"{s['atr']:.3f}" if s["atr"] else "n/a",
-                f"{s['adx']:.1f}" if s["adx"] else "n/a",
+                (
+                    f"{s['atr']:.3f}"
+                    if s["atr"]
+                    else "n/a"
+                ),
+                (
+                    f"{s['adx']:.1f}"
+                    if s["adx"]
+                    else "n/a"
+                ),
                 s["compressed"],
+                s["bar_time"],
             )
 
-            pos = state.get("position")
+            pos = state.get(
+                "position"
+            )
 
             # ====================================================
             # OPEN POSITION MONITORING
             # ====================================================
-            if state.get("state") == "OPEN" and pos:
 
-                # Refresh actual position quantity before every
-                # risk decision.
-                p_result = wb.positions(trade)
+            if (
+                state.get("state")
+                == "OPEN"
+                and pos
+            ):
 
-                if not p_result.get("success"):
+                p_result = wb.positions(
+                    trade
+                )
+
+                if not p_result.get(
+                    "success"
+                ):
+
                     log.warning(
-                        "POSITION MONITOR: Webull position lookup "
-                        "failed; no exit submitted this cycle"
+                        "POSITION MONITOR: Webull position "
+                        "lookup failed; no exit submitted"
                     )
 
                 else:
+
                     actual = wb.find_matching_option_position(
-                        p_result.get("positions"),
-                        pos.get("contract") or {},
-                        pos.get("side"),
+                        p_result.get(
+                            "positions"
+                        ),
+                        pos.get(
+                            "contract"
+                        ) or {},
+                        pos.get(
+                            "side"
+                        ),
                     )
 
                     if (
-                        isinstance(actual, dict)
-                        and actual.get("ambiguous")
+                        isinstance(
+                            actual,
+                            dict,
+                        )
+                        and actual.get(
+                            "ambiguous"
+                        )
                     ):
-                        state["state"] = "RECOVERY_REQUIRED"
+
+                        state["state"] = (
+                            "RECOVERY_REQUIRED"
+                        )
+
                         state["last_error"] = (
-                            "Ambiguous live position during monitoring"
+                            "Ambiguous live position "
+                            "during monitoring"
                         )
 
                         save(state)
@@ -1288,10 +1816,10 @@ def main():
                         continue
 
                     if actual is None:
+
                         log.warning(
-                            "POSITION MONITOR: expected position "
-                            "is absent; re-querying before "
-                            "changing state"
+                            "POSITION MONITOR: expected "
+                            "position is absent; re-querying"
                         )
 
                         time.sleep(
@@ -1301,21 +1829,34 @@ def main():
                         continue
 
                     pos["quantity"] = int(
-                        actual.get("quantity") or 0
+                        actual.get(
+                            "quantity"
+                        ) or 0
                     )
 
-                    pos["position_cost_price"] = actual.get(
-                        "cost_price"
-                    )
-
-                    if not pos.get("entry_premium"):
-                        pos["entry_premium"] = actual.get(
+                    pos["position_cost_price"] = (
+                        actual.get(
                             "cost_price"
+                        )
+                    )
+
+                    if not pos.get(
+                        "entry_premium"
+                    ):
+
+                        pos["entry_premium"] = (
+                            actual.get(
+                                "cost_price"
+                            )
                         )
 
                     # =================================================
-                    # LIVE OPTION QUOTE / INTRABAR EXIT
+                    # LIVE OPTION QUOTE
+                    #
+                    # Exit conditions continue to be checked against
+                    # the live option quote every worker cycle.
                     # =================================================
+
                     quote = wb.option_quote(
                         data,
                         pos["symbol"],
@@ -1329,6 +1870,7 @@ def main():
                     )
 
                     if reason:
+
                         state = submit_exit(
                             trade,
                             data,
@@ -1341,14 +1883,19 @@ def main():
                         continue
 
             # ====================================================
-            # FLAT / ENTRY
+            # FLAT / INTRABAR ENTRY
             # ====================================================
-            elif state.get("state") == "FLAT":
+
+            elif state.get(
+                "state"
+            ) == "FLAT":
 
                 if force_exit_due():
+
                     pass
 
                 else:
+
                     state = maybe_enter(
                         trade,
                         data,
@@ -1358,17 +1905,31 @@ def main():
 
                     save(state)
 
-            state["last_bar"] = s["bar_time"]
+            state["last_bar"] = (
+                s["bar_time"]
+            )
 
             save(state)
 
-            if state.get("state") == "OPEN":
-                time.sleep(config.POLL_SECONDS)
+            if state.get(
+                "state"
+            ) == "OPEN":
+
+                time.sleep(
+                    config.POLL_SECONDS
+                )
+
             else:
-                time.sleep(config.IDLE_POLL_SECONDS)
+
+                time.sleep(
+                    config.IDLE_POLL_SECONDS
+                )
 
         except Exception as exc:
-            state["last_error"] = str(exc)
+
+            state["last_error"] = str(
+                exc
+            )
 
             save(state)
 
@@ -1383,6 +1944,7 @@ def main():
 
 
 if __name__ == "__main__":
+
     signal.signal(
         signal.SIGTERM,
         stop,
