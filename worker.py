@@ -4,9 +4,9 @@ import json
 import logging
 import os
 import signal
-import threading
 import time
 from datetime import datetime, timezone
+
 from zoneinfo import ZoneInfo
 
 import config
@@ -22,39 +22,34 @@ logging.basicConfig(
 log = logging.getLogger("worker")
 
 running = True
-_state_lock = threading.Lock()
 
-ET = ZoneInfo(config.TIMEZONE)
-
-
-# ============================================================
-# AGGRESSIVE ORDER PRICING
-# ============================================================
-#
-# ENTRY:
-# Buy slightly ABOVE the current ask.
-#
-# Example:
-#   ask = 0.70
-#   limit = 0.72
-#
-# EXIT:
-# Sell slightly BELOW the current bid.
-#
-# Example:
-#   bid = 0.62
-#   limit = 0.59
-#
-# These remain LIMIT orders.
-#
+ET = ZoneInfo(
+    config.TIMEZONE
+)
 
 ENTRY_PRICE_OFFSET = 0.02
 EXIT_PRICE_OFFSET = 0.03
+
+STREAM_STALE_SECONDS = 5.0
+OPTION_STREAM_WAIT_SECONDS = 5.0
 
 
 def stop(*_):
     global running
     running = False
+
+
+def default_state():
+    return {
+        "state": "FLAT",
+        "position": None,
+        "entry_order": None,
+        "exit_order": None,
+        "last_signal_bar": None,
+        "last_trade": 0,
+        "last_error": None,
+        "last_bar": None,
+    }
 
 
 def load():
@@ -80,18 +75,6 @@ def load():
         return default_state()
 
 
-def default_state():
-    return {
-        "state": "FLAT",
-        "position": None,
-        "entry_order": None,
-        "exit_order": None,
-        "last_signal_bar": None,
-        "last_trade": 0,
-        "last_error": None,
-    }
-
-
 def save(state):
     directory = os.path.dirname(
         os.path.abspath(
@@ -104,25 +87,27 @@ def save(state):
         exist_ok=True,
     )
 
-    tmp = config.STATE_PATH + ".tmp"
+    tmp = (
+        config.STATE_PATH
+        + ".tmp"
+    )
 
-    with _state_lock:
-        with open(
-            tmp,
-            "w",
-            encoding="utf-8",
-        ) as handle:
-            json.dump(
-                state,
-                handle,
-                indent=2,
-                default=str,
-            )
-
-        os.replace(
-            tmp,
-            config.STATE_PATH,
+    with open(
+        tmp,
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(
+            state,
+            handle,
+            indent=2,
+            default=str,
         )
+
+    os.replace(
+        tmp,
+        config.STATE_PATH,
+    )
 
 
 def now_et():
@@ -134,16 +119,24 @@ def now_et():
 def parse_hhmm(value):
     hour, minute = (
         int(x)
-        for x in value.split(":", 1)
+        for x in value.split(
+            ":",
+            1,
+        )
     )
 
     return hour, minute
 
 
-def at_or_after(hhmm, dt=None):
+def at_or_after(
+    hhmm,
+    dt=None,
+):
     dt = dt or now_et()
 
-    h, m = parse_hhmm(hhmm)
+    h, m = parse_hhmm(
+        hhmm
+    )
 
     return (
         dt.hour,
@@ -169,17 +162,19 @@ def in_rth(dt=None):
 
     return (
         sh,
-        sm
+        sm,
     ) <= (
         dt.hour,
-        dt.minute
+        dt.minute,
     ) < (
         eh,
-        em
+        em,
     )
 
 
-def new_entries_allowed(dt=None):
+def new_entries_allowed(
+    dt=None,
+):
     dt = dt or now_et()
 
     return (
@@ -195,7 +190,9 @@ def new_entries_allowed(dt=None):
     )
 
 
-def force_exit_due(dt=None):
+def force_exit_due(
+    dt=None,
+):
     return (
         at_or_after(
             config.FORCE_EXIT_TIME,
@@ -209,7 +206,10 @@ def force_exit_due(dt=None):
 
 
 def position_contract(pos):
-    return pos.get("contract") or {}
+    return (
+        pos.get("contract")
+        or {}
+    )
 
 
 def position_age_seconds(pos):
@@ -221,7 +221,9 @@ def position_age_seconds(pos):
         return max(
             0.0,
             (
-                datetime.now(timezone.utc)
+                datetime.now(
+                    timezone.utc
+                )
                 - started.astimezone(
                     timezone.utc
                 )
@@ -236,14 +238,9 @@ def position_age_seconds(pos):
         return float("inf")
 
 
-def aggressive_entry_price(ask):
-    """
-    Buy slightly above the current ask.
-
-    Example:
-        ask 0.70 -> 0.72
-    """
-
+def aggressive_entry_price(
+    ask,
+):
     if ask is None or ask <= 0:
         return None
 
@@ -253,14 +250,9 @@ def aggressive_entry_price(ask):
     )
 
 
-def aggressive_exit_price(bid):
-    """
-    Sell slightly below the current bid.
-
-    Example:
-        bid 0.62 -> 0.59
-    """
-
+def aggressive_exit_price(
+    bid,
+):
     if bid is None or bid <= 0:
         return None
 
@@ -273,10 +265,239 @@ def aggressive_exit_price(bid):
     )
 
 
-def entry_fill_state(trade, state):
-    order = state.get(
-        "entry_order"
-    ) or {}
+# ============================================================
+# LIVE 5-MINUTE BAR ENGINE
+# ============================================================
+
+def bar_bucket(
+    timestamp,
+):
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(
+            tzinfo=timezone.utc
+        )
+
+    timestamp = timestamp.astimezone(
+        timezone.utc
+    )
+
+    minute = (
+        timestamp.minute
+        - timestamp.minute % 5
+    )
+
+    return timestamp.replace(
+        minute=minute,
+        second=0,
+        microsecond=0,
+    )
+
+
+def seed_history(
+    data,
+):
+    raw = wb.bars(
+        data,
+        config.HISTORY_COUNT,
+    )
+
+    if len(raw) < 60:
+        raise RuntimeError(
+            f"Only {len(raw)} usable historical "
+            "bars returned"
+        )
+
+    return [
+        Bar(**x)
+        for x in raw
+    ]
+
+
+def update_live_bar(
+    history,
+    tick,
+):
+    if not tick:
+        return history
+
+    price = tick.get(
+        "price"
+    )
+
+    if price is None or price <= 0:
+        return history
+
+    timestamp = tick.get(
+        "timestamp"
+    )
+
+    if not isinstance(
+        timestamp,
+        datetime,
+    ):
+        timestamp = datetime.now(
+            timezone.utc
+        )
+
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(
+            tzinfo=timezone.utc
+        )
+
+    timestamp = timestamp.astimezone(
+        timezone.utc
+    )
+
+    bucket = bar_bucket(
+        timestamp
+    )
+
+    volume = float(
+        tick.get(
+            "volume",
+            0,
+        )
+        or 0
+    )
+
+    if not history:
+        history.append(
+            Bar(
+                timestamp=bucket,
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=volume,
+            )
+        )
+
+        return history
+
+    last = history[-1]
+
+    last_bucket = bar_bucket(
+        last.timestamp
+    )
+
+    if bucket > last_bucket:
+        history.append(
+            Bar(
+                timestamp=bucket,
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=volume,
+            )
+        )
+
+    elif bucket == last_bucket:
+        history[-1] = Bar(
+            timestamp=last.timestamp,
+            open=last.open,
+            high=max(
+                last.high,
+                price,
+            ),
+            low=min(
+                last.low,
+                price,
+            ),
+            close=price,
+            volume=max(
+                last.volume,
+                volume,
+            ),
+        )
+
+    else:
+        # Out-of-order tick. Do not corrupt the
+        # current bar.
+        return history
+
+    # Keep a manageable history while preserving
+    # enough bars for all indicators.
+    if len(history) > config.HISTORY_COUNT + 20:
+        del history[
+            :-config.HISTORY_COUNT
+        ]
+
+    return history
+
+
+def remove_stale_forming_bar(
+    history,
+    live_tick,
+):
+    """Remove the REST API's current/stale bar.
+
+    The first live tick becomes authoritative for
+    the new current forming bar.
+    """
+
+    if not history:
+        return history
+
+    timestamp = live_tick.get(
+        "timestamp"
+    )
+
+    if not isinstance(
+        timestamp,
+        datetime,
+    ):
+        return history
+
+    bucket = bar_bucket(
+        timestamp
+    )
+
+    while (
+        history
+        and bar_bucket(
+            history[-1].timestamp
+        ) >= bucket
+    ):
+        history.pop()
+
+    return history
+
+
+def stream_tick_fresh(
+    tick,
+):
+    if not tick:
+        return False
+
+    received = tick.get(
+        "received_monotonic"
+    )
+
+    if received is None:
+        return False
+
+    return (
+        time.monotonic()
+        - received
+        <= STREAM_STALE_SECONDS
+    )
+
+
+# ============================================================
+# ORDER RECONCILIATION
+# ============================================================
+
+def entry_fill_state(
+    trade,
+    state,
+):
+    order = (
+        state.get(
+            "entry_order"
+        )
+        or {}
+    )
 
     cid = order.get(
         "client_order_id"
@@ -291,19 +512,33 @@ def entry_fill_state(trade, state):
     )
 
     order.update({
-        "status": detail.get("status"),
-        "status_class": detail.get("status_class"),
-        "filled_qty": detail.get("filled_qty"),
-        "filled_price": detail.get("filled_price"),
-        "total_qty": detail.get("total_qty"),
-        "order_id": detail.get("order_id"),
+        "status": detail.get(
+            "status"
+        ),
+        "status_class": detail.get(
+            "status_class"
+        ),
+        "filled_qty": detail.get(
+            "filled_qty"
+        ),
+        "filled_price": detail.get(
+            "filled_price"
+        ),
+        "total_qty": detail.get(
+            "total_qty"
+        ),
+        "order_id": detail.get(
+            "order_id"
+        ),
     })
 
     position_result = wb.positions(
         trade
     )
 
-    if not position_result.get("success"):
+    if not position_result.get(
+        "success"
+    ):
         log.warning(
             "ENTRY RECONCILE: position query failed; "
             "keeping PENDING_ENTRY"
@@ -311,15 +546,26 @@ def entry_fill_state(trade, state):
 
         return state, False
 
-    pos = wb.find_matching_option_position(
-        position_result.get("positions"),
-        state["position"]["contract"],
-        state["position"]["side"],
-    ) if state.get("position") else None
+    pos = (
+        wb.find_matching_option_position(
+            position_result.get(
+                "positions"
+            ),
+            state["position"]["contract"],
+            state["position"]["side"],
+        )
+        if state.get("position")
+        else None
+    )
 
     if (
-        isinstance(pos, dict)
-        and pos.get("ambiguous")
+        isinstance(
+            pos,
+            dict,
+        )
+        and pos.get(
+            "ambiguous"
+        )
     ):
         state["state"] = (
             "RECOVERY_REQUIRED"
@@ -330,10 +576,6 @@ def entry_fill_state(trade, state):
             "refusing to guess"
         )
 
-        log.error(
-            "ENTRY RECONCILE: ambiguous position match"
-        )
-
         return state, True
 
     status_class = detail.get(
@@ -341,7 +583,9 @@ def entry_fill_state(trade, state):
     )
 
     filled_qty = (
-        detail.get("filled_qty")
+        detail.get(
+            "filled_qty"
+        )
         or 0
     )
 
@@ -359,7 +603,9 @@ def entry_fill_state(trade, state):
     ):
         try:
             age = (
-                datetime.now(timezone.utc)
+                datetime.now(
+                    timezone.utc
+                )
                 - datetime.fromisoformat(
                     submitted_at
                 ).astimezone(
@@ -398,7 +644,12 @@ def entry_fill_state(trade, state):
 
     if (
         pos
-        and (pos.get("quantity") or 0) > 0
+        and (
+            pos.get(
+                "quantity"
+            )
+            or 0
+        ) > 0
     ):
         actual_qty = int(
             pos["quantity"]
@@ -406,15 +657,21 @@ def entry_fill_state(trade, state):
 
         actual_entry = (
             filled_price
-            or pos.get("cost_price")
+            or pos.get(
+                "cost_price"
+            )
         )
 
         state["position"].update({
             "quantity": actual_qty,
             "entry_premium": actual_entry,
             "filled_qty": filled_qty,
-            "entry_order_status": detail.get("status"),
-            "position_cost_price": pos.get("cost_price"),
+            "entry_order_status": detail.get(
+                "status"
+            ),
+            "position_cost_price": pos.get(
+                "cost_price"
+            ),
         })
 
         state["state"] = "OPEN"
@@ -428,10 +685,13 @@ def entry_fill_state(trade, state):
         )
 
         if (
-            status_class == "PARTIAL_FILLED"
+            status_class
+            == "PARTIAL_FILLED"
             and filled_qty
             < (
-                detail.get("total_qty")
+                detail.get(
+                    "total_qty"
+                )
                 or filled_qty
             )
         ):
@@ -467,12 +727,6 @@ def entry_fill_state(trade, state):
             "without a Webull position"
         )
 
-        log.warning(
-            "ENTRY FINAL WITHOUT POSITION: status=%s filled_qty=%s",
-            detail.get("status"),
-            filled_qty,
-        )
-
         return state, True
 
     if status_class == "FILLED":
@@ -485,19 +739,21 @@ def entry_fill_state(trade, state):
             "position is not yet visible"
         )
 
-        log.warning(
-            "ENTRY FILLED/NO POSITION: keeping PENDING_ENTRY"
-        )
-
         return state, True
 
     return state, False
 
 
-def reconcile_exit(trade, state):
-    order = state.get(
-        "exit_order"
-    ) or {}
+def reconcile_exit(
+    trade,
+    state,
+):
+    order = (
+        state.get(
+            "exit_order"
+        )
+        or {}
+    )
 
     cid = order.get(
         "client_order_id"
@@ -512,19 +768,33 @@ def reconcile_exit(trade, state):
     )
 
     order.update({
-        "status": detail.get("status"),
-        "status_class": detail.get("status_class"),
-        "filled_qty": detail.get("filled_qty"),
-        "filled_price": detail.get("filled_price"),
-        "total_qty": detail.get("total_qty"),
-        "order_id": detail.get("order_id"),
+        "status": detail.get(
+            "status"
+        ),
+        "status_class": detail.get(
+            "status_class"
+        ),
+        "filled_qty": detail.get(
+            "filled_qty"
+        ),
+        "filled_price": detail.get(
+            "filled_price"
+        ),
+        "total_qty": detail.get(
+            "total_qty"
+        ),
+        "order_id": detail.get(
+            "order_id"
+        ),
     })
 
     position_result = wb.positions(
         trade
     )
 
-    if not position_result.get("success"):
+    if not position_result.get(
+        "success"
+    ):
         log.warning(
             "EXIT RECONCILE: position query failed; "
             "retaining PENDING_EXIT"
@@ -533,14 +803,21 @@ def reconcile_exit(trade, state):
         return state, False
 
     pos = wb.find_matching_option_position(
-        position_result.get("positions"),
+        position_result.get(
+            "positions"
+        ),
         state["position"]["contract"],
         state["position"]["side"],
-    ) if state.get("position") else None
+    )
 
     if (
-        isinstance(pos, dict)
-        and pos.get("ambiguous")
+        isinstance(
+            pos,
+            dict,
+        )
+        and pos.get(
+            "ambiguous"
+        )
     ):
         state["state"] = (
             "RECOVERY_REQUIRED"
@@ -553,13 +830,20 @@ def reconcile_exit(trade, state):
         return state, True
 
     remaining = (
-        int(pos.get("quantity") or 0)
+        int(
+            pos.get(
+                "quantity"
+            )
+            or 0
+        )
         if pos
         else 0
     )
 
     filled_qty = int(
-        detail.get("filled_qty")
+        detail.get(
+            "filled_qty"
+        )
         or 0
     )
 
@@ -577,8 +861,12 @@ def reconcile_exit(trade, state):
             "STATE PENDING_EXIT -> FLAT: "
             "exit_fill_qty=%s exit_avg=%s status=%s",
             filled_qty,
-            detail.get("filled_price"),
-            detail.get("status"),
+            detail.get(
+                "filled_price"
+            ),
+            detail.get(
+                "status"
+            ),
         )
 
         return state, True
@@ -600,13 +888,6 @@ def reconcile_exit(trade, state):
             f"with {remaining} contracts remaining"
         )
 
-        log.warning(
-            "STATE PENDING_EXIT -> OPEN: "
-            "remaining=%s status=%s",
-            remaining,
-            detail.get("status"),
-        )
-
         return state, True
 
     state["position"]["quantity"] = (
@@ -616,16 +897,21 @@ def reconcile_exit(trade, state):
     return state, False
 
 
-def recover_from_webull(trade, state):
+# ============================================================
+# STARTUP RECOVERY
+# ============================================================
+
+def recover_from_webull(
+    trade,
+    state,
+):
     result = wb.positions(
         trade
     )
 
-    if not result.get("success"):
-        log.error(
-            "STARTUP RECOVERY: cannot query Webull positions"
-        )
-
+    if not result.get(
+        "success"
+    ):
         state["state"] = (
             "RECOVERY_REQUIRED"
         )
@@ -637,7 +923,9 @@ def recover_from_webull(trade, state):
         return state
 
     items = wb._position_items(
-        result.get("positions")
+        result.get(
+            "positions"
+        )
     )
 
     option_positions = []
@@ -648,15 +936,26 @@ def recover_from_webull(trade, state):
         )
 
         if (
-            p.get("instrument_type")
+            p.get(
+                "instrument_type"
+            )
             == "OPTION"
-            and (p.get("quantity") or 0) > 0
+            and (
+                p.get(
+                    "quantity"
+                )
+                or 0
+            ) > 0
         ):
-            option_positions.append(p)
+            option_positions.append(
+                p
+            )
 
     if not option_positions:
         if (
-            state.get("state")
+            state.get(
+                "state"
+            )
             == "PENDING_ENTRY"
             and state.get(
                 "entry_order",
@@ -667,7 +966,9 @@ def recover_from_webull(trade, state):
         ):
             cid = state[
                 "entry_order"
-            ]["client_order_id"]
+            ][
+                "client_order_id"
+            ]
 
             try:
                 detail = wb.order_detail(
@@ -687,8 +988,8 @@ def recover_from_webull(trade, state):
                     )
 
                     log.warning(
-                        "STARTUP RECOVERY: "
-                        "canceled stale pending entry %s -> %s",
+                        "STARTUP RECOVERY: canceled stale "
+                        "pending entry %s -> %s",
                         cid,
                         cancel,
                     )
@@ -742,17 +1043,16 @@ def recover_from_webull(trade, state):
             "More than one open option position exists in Webull Sandbox"
         )
 
-        log.error(
-            "STARTUP RECOVERY: multiple option positions"
-        )
-
         return state
 
     p = option_positions[0]
 
-    old = state.get(
-        "position"
-    ) or {}
+    old = (
+        state.get(
+            "position"
+        )
+        or {}
+    )
 
     contract = old.get(
         "contract"
@@ -761,26 +1061,44 @@ def recover_from_webull(trade, state):
     if not contract:
         contract = {
             "symbol": None,
-            "strike_price": p.get("strike"),
-            "expiration_date": p.get("expiration"),
-            "option_type": p.get("option_type"),
+            "strike_price": p.get(
+                "strike"
+            ),
+            "expiration_date": p.get(
+                "expiration"
+            ),
+            "option_type": p.get(
+                "option_type"
+            ),
         }
 
     state["position"] = {
         **old,
-        "side": p.get("option_type"),
+        "side": p.get(
+            "option_type"
+        ),
         "symbol": (
-            contract.get("symbol")
-            or p.get("symbol")
+            contract.get(
+                "symbol"
+            )
+            or p.get(
+                "symbol"
+            )
         ),
         "contract": contract,
         "quantity": int(
-            p.get("quantity")
+            p.get(
+                "quantity"
+            )
             or 0
         ),
         "entry_premium": (
-            old.get("entry_premium")
-            or p.get("cost_price")
+            old.get(
+                "entry_premium"
+            )
+            or p.get(
+                "cost_price"
+            )
         ),
         "entry_underlying": old.get(
             "entry_underlying"
@@ -789,37 +1107,40 @@ def recover_from_webull(trade, state):
             "entry_atr"
         ),
         "entry_time": (
-            old.get("entry_time")
+            old.get(
+                "entry_time"
+            )
             or datetime.now(
                 timezone.utc
             ).isoformat()
         ),
     }
 
-    if state["state"] != "PENDING_EXIT":
+    if (
+        state["state"]
+        != "PENDING_EXIT"
+    ):
         state["state"] = "OPEN"
-
-    log.warning(
-        "STARTUP RECOVERY: adopted Webull position "
-        "qty=%s type=%s strike=%s expiry=%s state=%s",
-        p.get("quantity"),
-        p.get("option_type"),
-        p.get("strike"),
-        p.get("expiration"),
-        state["state"],
-    )
 
     return state
 
 
+# ============================================================
+# EXIT RETRY
+# ============================================================
+
 def retry_stale_exit(
     trade,
     data,
+    stream,
     state,
 ):
-    order = state.get(
-        "exit_order"
-    ) or {}
+    order = (
+        state.get(
+            "exit_order"
+        )
+        or {}
+    )
 
     submitted = order.get(
         "submitted_at"
@@ -830,7 +1151,9 @@ def retry_stale_exit(
 
     try:
         age = (
-            datetime.now(timezone.utc)
+            datetime.now(
+                timezone.utc
+            )
             - datetime.fromisoformat(
                 submitted
             ).astimezone(
@@ -851,7 +1174,9 @@ def retry_stale_exit(
         return state
 
     retries = int(
-        order.get("retries")
+        order.get(
+            "retries"
+        )
         or 0
     )
 
@@ -865,10 +1190,6 @@ def retry_stale_exit(
 
         state["last_error"] = (
             "Exit remained unresolved after maximum retries"
-        )
-
-        log.error(
-            "EXIT EMERGENCY: max retries reached"
         )
 
         return state
@@ -901,26 +1222,36 @@ def retry_stale_exit(
         trade
     )
 
-    if not pos_result.get("success"):
-        log.warning(
-            "EXIT RETRY: unable to verify position"
-        )
-
+    if not pos_result.get(
+        "success"
+    ):
         return state
 
-    pos = state.get(
-        "position"
-    ) or {}
+    pos = (
+        state.get(
+            "position"
+        )
+        or {}
+    )
 
     actual = wb.find_matching_option_position(
-        pos_result.get("positions"),
-        pos.get("contract") or {},
-        pos.get("side"),
+        pos_result.get(
+            "positions"
+        ),
+        pos.get(
+            "contract"
+        )
+        or {},
+        pos.get(
+            "side"
+        ),
     )
 
     if (
         not actual
-        or actual.get("ambiguous")
+        or actual.get(
+            "ambiguous"
+        )
     ):
         state["state"] = (
             "RECOVERY_REQUIRED"
@@ -934,7 +1265,9 @@ def retry_stale_exit(
         return state
 
     remaining = int(
-        actual.get("quantity")
+        actual.get(
+            "quantity"
+        )
         or 0
     )
 
@@ -945,19 +1278,31 @@ def retry_stale_exit(
 
         return state
 
-    quote = wb.option_quote(
-        data,
-        pos["symbol"],
+    symbol = pos.get(
+        "symbol"
     )
 
-    bid = quote.get("bid")
+    quote = (
+        stream.option_quote_live(
+            symbol
+        )
+        if symbol
+        else None
+    )
 
-    if bid is None or bid <= 0:
+    if not quote:
         log.warning(
-            "EXIT RETRY: no valid bid for %s",
-            pos["symbol"],
+            "EXIT RETRY: no fresh live quote for %s",
+            symbol,
         )
 
+        return state
+
+    bid = quote.get(
+        "bid"
+    )
+
+    if bid is None or bid <= 0:
         return state
 
     price = aggressive_exit_price(
@@ -967,14 +1312,6 @@ def retry_stale_exit(
     if price is None:
         return state
 
-    log.warning(
-        "EXIT RETRY PRICING: bid=%.2f -> limit=%.2f "
-        "(%.2f below bid)",
-        bid,
-        price,
-        EXIT_PRICE_OFFSET,
-    )
-
     result = wb.exit_order(
         pos["contract"],
         pos["side"],
@@ -982,18 +1319,15 @@ def retry_stale_exit(
         price,
     )
 
-    if not result.get("success"):
-        log.error(
-            "EXIT RETRY REJECTED: %s",
-            result,
-        )
-
+    if not result.get(
+        "success"
+    ):
         order["retries"] = (
             retries + 1
         )
 
-        order["last_retry_error"] = (
-            str(result)
+        order["last_retry_error"] = str(
+            result
         )
 
         order["submitted_at"] = (
@@ -1024,20 +1358,12 @@ def retry_stale_exit(
         "limit_price": price,
     }
 
-    log.warning(
-        "EXIT RETRY %s: new order=%s qty=%s "
-        "bid=%.2f limit=%.2f",
-        retries + 1,
-        result.get(
-            "client_order_id"
-        ),
-        remaining,
-        bid,
-        price,
-    )
-
     return state
 
+
+# ============================================================
+# RISK
+# ============================================================
 
 def risk_reason(
     pos,
@@ -1103,7 +1429,9 @@ def risk_reason(
             return "OPTION_BREAKEVEN"
 
     if (
-        signal_snapshot.get("atr")
+        signal_snapshot.get(
+            "atr"
+        )
         is not None
         and pos.get(
             "entry_underlying"
@@ -1116,37 +1444,55 @@ def risk_reason(
 
         if (
             config.USE_BE
-            and pos.get("side")
+            and pos.get(
+                "side"
+            )
             == "CALL"
-            and signal_snapshot["close"]
+            and signal_snapshot[
+                "close"
+            ]
             >= be
         ):
             stop = max(
                 stop,
-                pos["entry_underlying"],
+                pos[
+                    "entry_underlying"
+                ],
             )
 
         if (
             config.USE_BE
-            and pos.get("side")
+            and pos.get(
+                "side"
+            )
             == "PUT"
-            and signal_snapshot["close"]
+            and signal_snapshot[
+                "close"
+            ]
             <= be
         ):
             stop = min(
                 stop,
-                pos["entry_underlying"],
+                pos[
+                    "entry_underlying"
+                ],
             )
 
-        if pos.get("side") == "CALL":
+        if pos.get(
+            "side"
+        ) == "CALL":
             if (
-                signal_snapshot["close"]
+                signal_snapshot[
+                    "close"
+                ]
                 <= stop
             ):
                 return "UNDERLYING_STOP"
 
             if (
-                signal_snapshot["close"]
+                signal_snapshot[
+                    "close"
+                ]
                 >= target
             ):
                 return "UNDERLYING_TARGET"
@@ -1156,20 +1502,28 @@ def risk_reason(
                 and signal_snapshot.get(
                     "upper"
                 ) is not None
-                and signal_snapshot["close"]
-                >= signal_snapshot["upper"]
+                and signal_snapshot[
+                    "close"
+                ]
+                >= signal_snapshot[
+                    "upper"
+                ]
             ):
                 return "WAVE_ZONE"
 
         else:
             if (
-                signal_snapshot["close"]
+                signal_snapshot[
+                    "close"
+                ]
                 >= stop
             ):
                 return "UNDERLYING_STOP"
 
             if (
-                signal_snapshot["close"]
+                signal_snapshot[
+                    "close"
+                ]
                 <= target
             ):
                 return "UNDERLYING_TARGET"
@@ -1179,26 +1533,39 @@ def risk_reason(
                 and signal_snapshot.get(
                     "lower"
                 ) is not None
-                and signal_snapshot["close"]
-                <= signal_snapshot["lower"]
+                and signal_snapshot[
+                    "close"
+                ]
+                <= signal_snapshot[
+                    "lower"
+                ]
             ):
                 return "WAVE_ZONE"
 
     return None
 
 
+# ============================================================
+# EXIT SUBMISSION
+# ============================================================
+
 def submit_exit(
     trade,
-    data,
+    stream,
     state,
     reason,
 ):
-    pos = state.get(
-        "position"
-    ) or {}
+    pos = (
+        state.get(
+            "position"
+        )
+        or {}
+    )
 
     quantity = int(
-        pos.get("quantity")
+        pos.get(
+            "quantity"
+        )
         or 0
     )
 
@@ -1206,10 +1573,6 @@ def submit_exit(
         raise RuntimeError(
             "Cannot exit: actual position quantity is zero"
         )
-
-    # ------------------------------------------------------------
-    # FINAL POSITION VERIFICATION
-    # ------------------------------------------------------------
 
     positions_result = wb.positions(
         trade
@@ -1223,21 +1586,32 @@ def submit_exit(
         )
 
     actual = wb.find_matching_option_position(
-        positions_result.get("positions"),
-        pos.get("contract") or {},
-        pos.get("side"),
+        positions_result.get(
+            "positions"
+        ),
+        pos.get(
+            "contract"
+        )
+        or {},
+        pos.get(
+            "side"
+        ),
     )
 
     if (
         not actual
-        or actual.get("ambiguous")
+        or actual.get(
+            "ambiguous"
+        )
     ):
         raise RuntimeError(
             "Cannot uniquely verify Webull position before exit"
         )
 
     quantity = int(
-        actual.get("quantity")
+        actual.get(
+            "quantity"
+        )
         or 0
     )
 
@@ -1246,14 +1620,22 @@ def submit_exit(
             "Webull position disappeared before exit submission"
         )
 
-    # ------------------------------------------------------------
-    # LIVE OPTION QUOTE
-    # ------------------------------------------------------------
-
-    quote = wb.option_quote(
-        data,
-        pos["symbol"],
+    symbol = pos.get(
+        "symbol"
     )
+
+    quote = (
+        stream.option_quote_live(
+            symbol
+        )
+        if symbol
+        else None
+    )
+
+    if not quote:
+        raise RuntimeError(
+            "No fresh live option quote available for exit"
+        )
 
     bid = quote.get(
         "bid"
@@ -1261,12 +1643,8 @@ def submit_exit(
 
     if bid is None or bid <= 0:
         raise RuntimeError(
-            "No valid option bid available for exit"
+            "No valid live option bid available for exit"
         )
-
-    # ------------------------------------------------------------
-    # AGGRESSIVE EXIT
-    # ------------------------------------------------------------
 
     price = aggressive_exit_price(
         bid
@@ -1281,7 +1659,7 @@ def submit_exit(
         "EXIT PRICING: reason=%s symbol=%s qty=%s "
         "bid=%.2f -> limit=%.2f",
         reason,
-        pos["symbol"],
+        symbol,
         quantity,
         bid,
         price,
@@ -1295,16 +1673,6 @@ def submit_exit(
     )
 
     if config.DRY_RUN:
-        log.info(
-            "DRY_RUN EXIT reason=%s symbol=%s qty=%s "
-            "bid=%.2f limit=%.2f",
-            reason,
-            pos["symbol"],
-            quantity,
-            bid,
-            price,
-        )
-
         state["state"] = "FLAT"
         state["position"] = None
         state["exit_order"] = None
@@ -1312,7 +1680,9 @@ def submit_exit(
 
         return state
 
-    if not result.get("success"):
+    if not result.get(
+        "success"
+    ):
         raise RuntimeError(
             f"Webull exit was not accepted: {result}"
         )
@@ -1366,19 +1736,28 @@ def submit_exit(
     return state
 
 
+# ============================================================
+# ENTRY
+# ============================================================
+
 def maybe_enter(
     trade,
     data,
+    stream,
     state,
     snapshot,
 ):
-    if (
-        not snapshot.get("signal")
-        or not new_entries_allowed()
+    if not snapshot.get(
+        "signal"
     ):
         return state
 
-    if state.get("state") != "FLAT":
+    if not new_entries_allowed():
+        return state
+
+    if state.get(
+        "state"
+    ) != "FLAT":
         return state
 
     if (
@@ -1391,10 +1770,14 @@ def maybe_enter(
     ):
         return state
 
+    # Prevent repeated entry orders from the
+    # same intrabar transition.
     if (
-        snapshot.get("bar_time")
+        snapshot.get(
+            "signal_event_id"
+        )
         == state.get(
-            "last_signal_bar"
+            "last_signal_event"
         )
     ):
         return state
@@ -1406,17 +1789,39 @@ def maybe_enter(
     contract = wb.choose(
         data,
         option_type,
-        snapshot["close"],
+        snapshot[
+            "close"
+        ],
     )
 
     symbol = contract.get(
         "symbol"
     )
 
-    quote = wb.option_quote(
-        data,
-        symbol,
+    if not symbol:
+        log.warning(
+            "ENTRY SKIP: selected option has no symbol"
+        )
+
+        return state
+
+    # Subscribe before requesting the live quote.
+    stream.subscribe_option(
+        symbol
     )
+
+    quote = stream.wait_for_option_quote(
+        symbol,
+        OPTION_STREAM_WAIT_SECONDS,
+    )
+
+    if not quote:
+        log.info(
+            "ENTRY SKIP: no fresh live option quote for %s",
+            symbol,
+        )
+
+        return state
 
     bid = quote.get(
         "bid"
@@ -1430,12 +1835,9 @@ def maybe_enter(
         bid is None
         or ask is None
         or ask <= 0
+        or bid <= 0
+        or ask < bid
     ):
-        log.info(
-            "ENTRY SKIP: no bid/ask for %s",
-            symbol,
-        )
-
         return state
 
     mid = (
@@ -1443,7 +1845,8 @@ def maybe_enter(
     ) / 2
 
     spread = (
-        (ask - bid) / mid
+        (ask - bid)
+        / mid
         if mid
         else float("inf")
     )
@@ -1463,10 +1866,6 @@ def maybe_enter(
         )
 
         return state
-
-    # ------------------------------------------------------------
-    # AGGRESSIVE ENTRY
-    # ------------------------------------------------------------
 
     entry_price = aggressive_entry_price(
         ask
@@ -1492,7 +1891,9 @@ def maybe_enter(
         entry_price,
     )
 
-    if not result.get("success"):
+    if not result.get(
+        "success"
+    ):
         log.error(
             "ENTRY REJECTED: %s",
             result,
@@ -1504,9 +1905,13 @@ def maybe_enter(
 
         return state
 
-    state["last_signal_bar"] = (
-        snapshot["bar_time"]
+    event_id = snapshot.get(
+        "signal_event_id"
     )
+
+    state[
+        "last_signal_event"
+    ] = event_id
 
     if config.DRY_RUN:
         state["state"] = "OPEN"
@@ -1528,24 +1933,18 @@ def maybe_enter(
             "symbol": symbol,
             "contract": contract,
             "quantity": config.OPTION_QUANTITY,
-            "entry_underlying": snapshot["close"],
-            "entry_atr": snapshot["atr"],
+            "entry_underlying": snapshot[
+                "close"
+            ],
+            "entry_atr": snapshot[
+                "atr"
+            ],
             "entry_premium": entry_price,
             "entry_time": datetime.now(
                 timezone.utc
             ).isoformat(),
             "option_breakeven_armed": False,
         }
-
-        log.info(
-            "DRY_RUN ENTRY FILLED: %s %s "
-            "qty=%s ask=%.2f limit=%.2f",
-            option_type,
-            symbol,
-            config.OPTION_QUANTITY,
-            ask,
-            entry_price,
-        )
 
         return state
 
@@ -1582,8 +1981,12 @@ def maybe_enter(
         "symbol": symbol,
         "contract": contract,
         "quantity": 0,
-        "entry_underlying": snapshot["close"],
-        "entry_atr": snapshot["atr"],
+        "entry_underlying": snapshot[
+            "close"
+        ],
+        "entry_atr": snapshot[
+            "atr"
+        ],
         "entry_premium": None,
         "entry_time": datetime.now(
             timezone.utc
@@ -1607,6 +2010,10 @@ def maybe_enter(
     return state
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
     global running
 
@@ -1623,21 +2030,94 @@ def main():
         "Connected to Webull SANDBOX. "
         "DRY_RUN=%s state=%s "
         "ENTRY_OFFSET=%.2f EXIT_OFFSET=%.2f "
-        "ENTRY_MODE=INTRABAR",
+        "DATA_MODE=LIVE_STREAM_INTRABAR",
         config.DRY_RUN,
-        state.get("state"),
+        state.get(
+            "state"
+        ),
         ENTRY_PRICE_OFFSET,
         EXIT_PRICE_OFFSET,
     )
 
+    # --------------------------------------------------------
+    # HISTORICAL WARM-UP
+    # --------------------------------------------------------
+
+    history = seed_history(
+        data
+    )
+
+    log.info(
+        "Historical warm-up complete: %s "
+        "five-minute bars loaded",
+        len(history),
+    )
+
+    # --------------------------------------------------------
+    # LIVE STREAM
+    # --------------------------------------------------------
+
+    stream = wb.LiveMarketStream()
+
+    session_id = stream.start()
+
+    log.info(
+        "Webull Sandbox live stream started "
+        "session=%s "
+        "mqtt=%s",
+        session_id,
+        wb.STREAM_MQTT_ENDPOINT,
+    )
+
+    # --------------------------------------------------------
+    # FIRST LIVE TICK
+    #
+    # Do not trust the historical API's current forming bar.
+    # The first live tick becomes the authoritative beginning
+    # of the current bar.
+    # --------------------------------------------------------
+
+    first_tick = stream.wait_for_stock_tick(
+        timeout=15.0
+    )
+
+    if not first_tick:
+        raise RuntimeError(
+            "No live SPY tick received from Webull "
+            "Sandbox stream"
+        )
+
+    history = remove_stale_forming_bar(
+        history,
+        first_tick,
+    )
+
+    history = update_live_bar(
+        history,
+        first_tick,
+    )
+
+    log.info(
+        "LIVE SPY STREAM ACTIVE: "
+        "price=%.2f bar=%s",
+        first_tick["price"],
+        history[-1].timestamp,
+    )
+
+    last_logged_bar = None
+    last_trend = None
+    last_signal_event = None
+
     while running:
         try:
-            # ----------------------------------------------------
+            # ------------------------------------------------
             # PENDING ENTRY
-            # ----------------------------------------------------
+            # ------------------------------------------------
 
             if (
-                state.get("state")
+                state.get(
+                    "state"
+                )
                 == "PENDING_ENTRY"
             ):
                 state, _ = entry_fill_state(
@@ -1648,7 +2128,9 @@ def main():
                 save(state)
 
                 if (
-                    state.get("state")
+                    state.get(
+                        "state"
+                    )
                     == "PENDING_ENTRY"
                 ):
                     time.sleep(
@@ -1657,12 +2139,14 @@ def main():
 
                     continue
 
-            # ----------------------------------------------------
+            # ------------------------------------------------
             # PENDING EXIT
-            # ----------------------------------------------------
+            # ------------------------------------------------
 
             if (
-                state.get("state")
+                state.get(
+                    "state"
+                )
                 == "PENDING_EXIT"
             ):
                 state, _ = reconcile_exit(
@@ -1671,19 +2155,24 @@ def main():
                 )
 
                 if (
-                    state.get("state")
+                    state.get(
+                        "state"
+                    )
                     == "PENDING_EXIT"
                 ):
                     state = retry_stale_exit(
                         trade,
                         data,
+                        stream,
                         state,
                     )
 
                 save(state)
 
                 if (
-                    state.get("state")
+                    state.get(
+                        "state"
+                    )
                     == "PENDING_EXIT"
                 ):
                     time.sleep(
@@ -1692,12 +2181,14 @@ def main():
 
                     continue
 
-            # ----------------------------------------------------
+            # ------------------------------------------------
             # RECOVERY
-            # ----------------------------------------------------
+            # ------------------------------------------------
 
             if (
-                state.get("state")
+                state.get(
+                    "state"
+                )
                 == "RECOVERY_REQUIRED"
             ):
                 log.error(
@@ -1720,72 +2211,135 @@ def main():
 
                 continue
 
-            # ----------------------------------------------------
-            # MARKET DATA
-            # ----------------------------------------------------
+            # ------------------------------------------------
+            # LIVE SPY TICK
+            # ------------------------------------------------
 
-            raw = wb.bars(
-                data,
-                config.HISTORY_COUNT,
-            )
+            tick = stream.stock_tick()
 
-            bs = [
-                Bar(**x)
-                for x in raw
-            ]
-
-            if len(bs) < 60:
-                raise RuntimeError(
-                    f"Only {len(bs)} usable bars returned"
+            if not stream_tick_fresh(
+                tick
+            ):
+                log.warning(
+                    "LIVE DATA STALE: no fresh SPY "
+                    "tick; trading paused"
                 )
 
-            # ====================================================
-            # IMPORTANT:
-            #
-            # DO NOT USE bs[:-1].
-            #
-            # The final bar is the CURRENT FORMING 5-minute bar.
-            # analyze(bs) therefore evaluates the strategy
-            # intrabar.
-            # ====================================================
+                time.sleep(
+                    0.25
+                )
 
-            s = analyze(bs)
+                continue
 
-            log.info(
-                "SPY %.2f trend=%s signal=%s "
-                "ATR=%s ADX=%s compressed=%s "
-                "bar=%s INTRABAR",
-                s["close"],
-                (
-                    "UP"
-                    if s["trend"] == 1
-                    else "DOWN"
-                ),
-                s["signal"] or "-",
-                (
-                    f"{s['atr']:.3f}"
-                    if s["atr"]
-                    else "n/a"
-                ),
-                (
-                    f"{s['adx']:.1f}"
-                    if s["adx"]
-                    else "n/a"
-                ),
-                s["compressed"],
-                s["bar_time"],
+            history = update_live_bar(
+                history,
+                tick,
             )
+
+            if len(history) < 60:
+                time.sleep(
+                    0.1
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # INTRABAR STRATEGY
+            # ------------------------------------------------
+
+            snapshot = analyze(
+                history
+            )
+
+            current_bar = history[
+                -1
+            ]
+
+            current_bar_id = (
+                current_bar.timestamp.isoformat()
+            )
+
+            current_trend = snapshot.get(
+                "trend"
+            )
+
+            signal = snapshot.get(
+                "signal"
+            )
+
+            # A signal is a transition between the
+            # previous calculated trend and the current
+            # live trend.
+            #
+            # The same signal must not generate repeated
+            # orders on every tick.
+            signal_event_id = None
+
+            if signal:
+                signal_event_id = (
+                    current_bar_id
+                    + ":"
+                    + signal
+                )
+
+            snapshot[
+                "signal_event_id"
+            ] = signal_event_id
+
+            if (
+                current_trend
+                != last_trend
+            ):
+                log.info(
+                    "INTRABAR TREND FLIP: "
+                    "SPY=%.2f trend=%s signal=%s "
+                    "bar=%s",
+                    snapshot[
+                        "close"
+                    ],
+                    (
+                        "UP"
+                        if current_trend
+                        == 1
+                        else "DOWN"
+                    ),
+                    signal or "-",
+                    current_bar_id,
+                )
+
+                last_trend = current_trend
+
+            if (
+                signal
+                and signal_event_id
+                != last_signal_event
+            ):
+                log.info(
+                    "INTRABAR SIGNAL: %s "
+                    "SPY=%.2f bar=%s",
+                    signal,
+                    snapshot[
+                        "close"
+                    ],
+                    current_bar_id,
+                )
+
+                last_signal_event = (
+                    signal_event_id
+                )
+
+            # ------------------------------------------------
+            # OPEN POSITION
+            # ------------------------------------------------
 
             pos = state.get(
                 "position"
             )
 
-            # ----------------------------------------------------
-            # OPEN POSITION MONITORING
-            # ----------------------------------------------------
-
             if (
-                state.get("state")
+                state.get(
+                    "state"
+                )
                 == "OPEN"
                 and pos
             ):
@@ -1802,16 +2356,19 @@ def main():
                     )
 
                 else:
-                    actual = wb.find_matching_option_position(
-                        p_result.get(
-                            "positions"
-                        ),
-                        pos.get(
-                            "contract"
-                        ) or {},
-                        pos.get(
-                            "side"
-                        ),
+                    actual = (
+                        wb.find_matching_option_position(
+                            p_result.get(
+                                "positions"
+                            ),
+                            pos.get(
+                                "contract"
+                            )
+                            or {},
+                            pos.get(
+                                "side"
+                            ),
+                        )
                     )
 
                     if (
@@ -1823,11 +2380,15 @@ def main():
                             "ambiguous"
                         )
                     ):
-                        state["state"] = (
+                        state[
+                            "state"
+                        ] = (
                             "RECOVERY_REQUIRED"
                         )
 
-                        state["last_error"] = (
+                        state[
+                            "last_error"
+                        ] = (
                             "Ambiguous live position during monitoring"
                         )
 
@@ -1847,7 +2408,9 @@ def main():
 
                         continue
 
-                    pos["quantity"] = int(
+                    pos[
+                        "quantity"
+                    ] = int(
                         actual.get(
                             "quantity"
                         )
@@ -1869,26 +2432,43 @@ def main():
                             "cost_price"
                         )
 
-                    # ------------------------------------------------
-                    # LIVE OPTION QUOTE / INTRABAR EXIT
-                    # ------------------------------------------------
-
-                    quote = wb.option_quote(
-                        data,
-                        pos["symbol"],
+                    symbol = pos.get(
+                        "symbol"
                     )
+
+                    option_quote = (
+                        stream.option_quote_live(
+                            symbol
+                        )
+                        if symbol
+                        else None
+                    )
+
+                    if not option_quote:
+                        log.warning(
+                            "OPTION DATA STALE: "
+                            "no fresh quote for %s; "
+                            "risk decisions paused",
+                            symbol,
+                        )
+
+                        time.sleep(
+                            0.1
+                        )
+
+                        continue
 
                     reason = risk_reason(
                         pos,
-                        s,
-                        quote,
+                        snapshot,
+                        option_quote,
                         now_et(),
                     )
 
                     if reason:
                         state = submit_exit(
                             trade,
-                            data,
+                            stream,
                             state,
                             reason,
                         )
@@ -1897,50 +2477,44 @@ def main():
 
                         continue
 
-            # ----------------------------------------------------
+            # ------------------------------------------------
             # FLAT / ENTRY
-            # ----------------------------------------------------
+            # ------------------------------------------------
 
             elif (
-                state.get("state")
+                state.get(
+                    "state"
+                )
                 == "FLAT"
             ):
-                if force_exit_due():
-                    pass
-
-                else:
+                if not force_exit_due():
                     state = maybe_enter(
                         trade,
                         data,
+                        stream,
                         state,
-                        s,
+                        snapshot,
                     )
 
                     save(state)
 
-            state["last_bar"] = (
-                s["bar_time"]
-            )
+            state[
+                "last_bar"
+            ] = current_bar_id
 
             save(state)
 
-            if (
-                state.get("state")
-                == "OPEN"
-            ):
-                time.sleep(
-                    config.POLL_SECONDS
-                )
-
-            else:
-                time.sleep(
-                    config.IDLE_POLL_SECONDS
-                )
+            # The live stream drives the loop.
+            # There is deliberately no 15-second market
+            # data polling delay anymore.
+            time.sleep(
+                0.05
+            )
 
         except Exception as exc:
-            state["last_error"] = str(
-                exc
-            )
+            state[
+                "last_error"
+            ] = str(exc)
 
             save(state)
 
@@ -1949,6 +2523,7 @@ def main():
                 exc,
             )
 
+            # Do not hammer Webull after an error.
             time.sleep(
                 config.IDLE_POLL_SECONDS
             )
