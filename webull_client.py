@@ -221,12 +221,15 @@ def bars(data, count):
                 )
 
             else:
-                dt = datetime.fromisoformat(
-                    str(ts).replace(
-                        "Z",
-                        "+00:00",
-                    )
+                iso_ts = str(ts).replace(
+                    "Z",
+                    "+00:00",
                 )
+
+                if iso_ts.endswith("+0000"):
+                    iso_ts = iso_ts[:-5] + "+00:00"
+
+                dt = datetime.fromisoformat(iso_ts)
 
                 if dt.tzinfo is None:
                     dt = dt.replace(
