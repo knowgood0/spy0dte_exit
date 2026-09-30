@@ -7,7 +7,10 @@ import signal
 import time
 from datetime import datetime, timezone
 
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 import config
 import webull_client as wb
@@ -2108,19 +2111,8 @@ def main():
     last_trend = None
     last_signal_event = None
 
-    # --------------------------------------------------------
-    # POSITION RECONCILIATION
-    #
-    # The live stream drives market/risk evaluation at high
-    # frequency. Webull REST position reconciliation is only
-    # needed periodically because risk_reason() uses the
-    # locally tracked position plus live streaming quotes.
-    #
-    # submit_exit() still performs an immediate Webull
-    # position verification before submitting an exit.
-    # --------------------------------------------------------
-
     next_position_reconcile = 0.0
+    cached_position_result = None
 
     while running:
         try:
@@ -2357,151 +2349,142 @@ def main():
                 == "OPEN"
                 and pos
             ):
-                # Webull position reconciliation is deliberately
-                # throttled. The live stream remains the source
-                # for intrabar price/risk decisions.
-                reconcile_now = time.monotonic()
+                if time.monotonic() >= next_position_reconcile or cached_position_result is None:
+                    p_result = wb.positions(trade)
+                    cached_position_result = p_result
+                    next_position_reconcile = time.monotonic() + 10.0
+                else:
+                    p_result = cached_position_result
 
-                if (
-                    reconcile_now
-                    >= next_position_reconcile
+                if not p_result.get(
+                    "success"
                 ):
-                    next_position_reconcile = (
-                        reconcile_now
-                        + config.RECOVERY_POLL_SECONDS
+                    log.warning(
+                        "POSITION MONITOR: "
+                        "Webull position lookup failed"
                     )
 
-                    p_result = wb.positions(
-                        trade
+                else:
+                    actual = (
+                        wb.find_matching_option_position(
+                            p_result.get(
+                                "positions"
+                            ),
+                            pos.get(
+                                "contract"
+                            )
+                            or {},
+                            pos.get(
+                                "side"
+                            ),
+                        )
                     )
 
-                    if not p_result.get(
-                        "success"
+                    if (
+                        isinstance(
+                            actual,
+                            dict,
+                        )
+                        and actual.get(
+                            "ambiguous"
+                        )
                     ):
+                        state[
+                            "state"
+                        ] = (
+                            "RECOVERY_REQUIRED"
+                        )
+
+                        state[
+                            "last_error"
+                        ] = (
+                            "Ambiguous live position during monitoring"
+                        )
+
+                        save(state)
+
+                        continue
+
+                    if actual is None:
                         log.warning(
                             "POSITION MONITOR: "
-                            "Webull position lookup failed; "
-                            "continuing live risk evaluation"
+                            "expected position is absent"
                         )
 
-                    else:
-                        actual = (
-                            wb.find_matching_option_position(
-                                p_result.get(
-                                    "positions"
-                                ),
-                                pos.get(
-                                    "contract"
-                                )
-                                or {},
-                                pos.get(
-                                    "side"
-                                ),
-                            )
+                        time.sleep(
+                            config.RECOVERY_POLL_SECONDS
                         )
 
-                        if (
-                            isinstance(
-                                actual,
-                                dict,
-                            )
-                            and actual.get(
-                                "ambiguous"
-                            )
-                        ):
-                            state[
-                                "state"
-                            ] = (
-                                "RECOVERY_REQUIRED"
-                            )
+                        continue
 
-                            state[
-                                "last_error"
-                            ] = (
-                                "Ambiguous live position during monitoring"
-                            )
-
-                            save(state)
-
-                            continue
-
-                        if actual is None:
-                            log.warning(
-                                "POSITION MONITOR: "
-                                "expected position is absent; "
-                                "skipping risk evaluation until next reconciliation"
-                            )
-
-                            continue
-
-                        pos[
+                    pos[
+                        "quantity"
+                    ] = int(
+                        actual.get(
                             "quantity"
-                        ] = int(
-                            actual.get(
-                                "quantity"
-                            )
-                            or 0
                         )
+                        or 0
+                    )
 
+                    pos[
+                        "position_cost_price"
+                    ] = actual.get(
+                        "cost_price"
+                    )
+
+                    if not pos.get(
+                        "entry_premium"
+                    ):
                         pos[
-                            "position_cost_price"
+                            "entry_premium"
                         ] = actual.get(
                             "cost_price"
                         )
 
-                        if not pos.get(
-                            "entry_premium"
-                        ):
-                            pos[
-                                "entry_premium"
-                            ] = actual.get(
-                                "cost_price"
-                            )
-
-                symbol = pos.get(
-                    "symbol"
-                )
-
-                option_quote = (
-                    stream.option_quote_live(
-                        symbol
-                    )
-                    if symbol
-                    else None
-                )
-
-                if not option_quote:
-                    log.warning(
-                        "OPTION DATA STALE: "
-                        "no fresh quote for %s; "
-                        "risk decisions paused",
-                        symbol,
+                    symbol = pos.get(
+                        "symbol"
                     )
 
-                    time.sleep(
-                        0.1
+                    option_quote = (
+                        stream.option_quote_live(
+                            symbol
+                        )
+                        if symbol
+                        else None
                     )
 
-                    continue
+                    if not option_quote:
+                        log.warning(
+                            "OPTION DATA STALE: "
+                            "no fresh quote for %s; "
+                            "risk decisions paused",
+                            symbol,
+                        )
 
-                reason = risk_reason(
-                    pos,
-                    snapshot,
-                    option_quote,
-                    now_et(),
-                )
+                        time.sleep(
+                            0.1
+                        )
 
-                if reason:
-                    state = submit_exit(
-                        trade,
-                        stream,
-                        state,
-                        reason,
+                        continue
+
+                    reason = risk_reason(
+                        pos,
+                        snapshot,
+                        option_quote,
+                        now_et(),
                     )
 
-                    save(state)
+                    if reason:
+                        state = submit_exit(
+                            trade,
+                            stream,
+                            state,
+                            reason,
+                        )
 
-                    continue
+                        save(state)
+
+                        continue
 
             # ------------------------------------------------
             # FLAT / ENTRY
