@@ -1,7 +1,8 @@
 from dataclasses import dataclass
 from math import sqrt
 from datetime import time
-from zoneinfo import ZoneInfo
+import pytz
+ZoneInfo = pytz.timezone
 
 ET = ZoneInfo("America/New_York")
 
@@ -203,6 +204,11 @@ def analyze(bs):
 
     hist = []
 
+    # Previous SuperTrend bands. These must be initialized
+    # before the first bar with a valid ATR value.
+    old_up = None
+    old_dn = None
+
     for i, b in enumerate(bs):
         if a[i] is None:
             hist.append(trend)
@@ -231,7 +237,7 @@ def analyze(bs):
             else:
                 dn = db
 
-        if i == 0:
+        if old_up is None or old_dn is None:
             prev_up = up
             prev_dn = dn
         else:
