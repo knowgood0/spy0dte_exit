@@ -70,7 +70,7 @@ MAX_HOLD_MINUTES = i("MAX_HOLD_MINUTES", MAX_BARS_IN_TRADE * 5)
 TIMEZONE = os.getenv("TRADING_TIMEZONE", "America/New_York")
 RTH_START = os.getenv("RTH_START", "09:30")
 RTH_END = os.getenv("RTH_END", "16:00")
-NO_NEW_ENTRIES_AFTER = os.getenv("NO_NEW_ENTRIES_AFTER", "15:45")
+NO_NEW_ENTRIES_AFTER = os.getenv("NO_NEW_ENTRIES_AFTER", "14:00")
 FORCE_EXIT_TIME = os.getenv("FORCE_EXIT_TIME", "15:55")
 
 # Pending-order safety.
