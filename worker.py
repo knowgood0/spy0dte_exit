@@ -2408,12 +2408,16 @@ def main():
                     if actual is None:
                         log.warning(
                             "POSITION MONITOR: "
-                            "expected position is absent"
+                            "expected position is absent; "
+                            "reconciling with Webull"
                         )
 
-                        time.sleep(
-                            config.RECOVERY_POLL_SECONDS
+                        state = recover_from_webull(
+                            trade,
+                            state,
                         )
+
+                        save(state)
 
                         continue
 
