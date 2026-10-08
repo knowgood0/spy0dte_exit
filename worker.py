@@ -1422,14 +1422,34 @@ def risk_reason(
                 "option_breakeven_armed"
             ] = True
 
-        if (
-            pos.get(
-                "option_breakeven_armed"
-            )
-            and change
-            <= config.OPTION_BREAKEVEN_FLOOR_PCT
+        if pos.get(
+            "option_breakeven_armed"
         ):
-            return "OPTION_BREAKEVEN"
+            peak_premium = float(
+                pos.get(
+                    "option_peak_premium"
+                )
+                or 0.0
+            )
+            if premium > peak_premium:
+                peak_premium = premium
+                pos[
+                    "option_peak_premium"
+                ] = premium
+
+            trail_level = peak_premium * (
+                1.0
+                - config.OPTION_TRAILING_STOP_PCT
+            )
+            floor_level = entry * (
+                1.0
+                + config.OPTION_BREAKEVEN_FLOOR_PCT
+            )
+            if premium <= max(
+                trail_level,
+                floor_level,
+            ):
+                return "OPTION_BREAKEVEN"
 
     if (
         signal_snapshot.get(
