@@ -1401,6 +1401,27 @@ def risk_reason(
             - 1.0
         )
 
+        peak_seen = float(
+            pos.get(
+                "option_peak_premium"
+            )
+            or 0.0
+        )
+        if premium > peak_seen:
+            pos[
+                "option_peak_premium"
+            ] = premium
+
+        low_seen = pos.get(
+            "option_low_premium"
+        )
+        if low_seen is None or premium < float(
+            low_seen
+        ):
+            pos[
+                "option_low_premium"
+            ] = premium
+
         if (
             change
             <= -config.OPTION_STOP_LOSS_PCT
@@ -1595,6 +1616,50 @@ def submit_exit(
     if quantity <= 0:
         raise RuntimeError(
             "Cannot exit: actual position quantity is zero"
+        )
+
+    try:
+        excursion = {
+            "ts": datetime.now(
+                timezone.utc
+            ).isoformat(),
+            "symbol": (
+                pos.get(
+                    "contract"
+                )
+                or {}
+            ).get(
+                "symbol"
+            ),
+            "entry_premium": pos.get(
+                "entry_premium"
+            ),
+            "peak_premium": pos.get(
+                "option_peak_premium"
+            ),
+            "low_premium": pos.get(
+                "option_low_premium"
+            ),
+            "reason": reason,
+        }
+        with open(
+            os.path.join(
+                os.path.dirname(
+                    os.path.abspath(
+                        __file__
+                    )
+                ),
+                "trade_excursions.jsonl",
+            ),
+            "a",
+        ) as fh:
+            fh.write(
+                json.dumps(excursion)
+                + "\n"
+            )
+    except Exception:
+        log.exception(
+            "Could not record trade excursion"
         )
 
     positions_result = wb.positions(
