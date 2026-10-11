@@ -13,6 +13,7 @@ except ImportError:
     from backports.zoneinfo import ZoneInfo
 
 import config
+import virtual_ledger
 import webull_client as wb
 from strategy import Bar, analyze, levels
 
@@ -679,6 +680,14 @@ def entry_fill_state(
 
         state["state"] = "OPEN"
 
+        try:
+            virtual_ledger.on_entry(
+                state["position"].get("symbol"),
+                actual_entry,
+            )
+        except Exception:
+            log.exception("virtual ledger entry hook failed")
+
         log.info(
             "STATE PENDING_ENTRY -> OPEN: "
             "actual_qty=%s entry_premium=%s order_status=%s",
@@ -871,6 +880,13 @@ def reconcile_exit(
                 "status"
             ),
         )
+
+        try:
+            virtual_ledger.on_exit(
+                detail.get("filled_price"),
+            )
+        except Exception:
+            log.exception("virtual ledger exit hook failed")
 
         return state, True
 
@@ -1278,6 +1294,14 @@ def retry_stale_exit(
         state["state"] = "FLAT"
         state["position"] = None
         state["exit_order"] = None
+
+        try:
+            # Exit completed while the fill price was unobservable (e.g.
+            # stale-exit recovery); the ledger falls back to entry premium
+            # and flags the exit as estimated.
+            virtual_ledger.on_exit(None)
+        except Exception:
+            log.exception("virtual ledger exit hook failed")
 
         return state
 
