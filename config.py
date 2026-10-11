@@ -67,6 +67,17 @@ OPTION_BREAKEVEN_FLOOR_PCT = f("OPTION_BREAKEVEN_FLOOR_PCT", 0.10)
 OPTION_TRAILING_STOP_PCT = f("OPTION_TRAILING_STOP_PCT", 0.11)
 MAX_HOLD_MINUTES = i("MAX_HOLD_MINUTES", MAX_BARS_IN_TRADE * 5)
 
+# Virtual compounding shadow ledger: a virtual sub-account that previews the
+# live milestone ladder (skim half at $1k/$5k/$10k/$20k/$30k, then doubling)
+# without touching real order sizing. Starts at the paper account's realized
+# net profit since 2026-09-14 ($465.46, Webull-verified).
+VIRTUAL_ENABLED = b("VIRTUAL_ENABLED", True)
+VIRTUAL_START_BALANCE = f("VIRTUAL_START_BALANCE", 465.46)
+VIRTUAL_TAX_RATE = f("VIRTUAL_TAX_RATE", 0.35)
+VIRTUAL_MILESTONES = [1000.0, 5000.0, 10000.0, 20000.0, 30000.0]
+VIRTUAL_STATE_PATH = os.getenv("VIRTUAL_STATE_PATH", "virtual_state.json")
+VIRTUAL_LEDGER_PATH = os.getenv("VIRTUAL_LEDGER_PATH", "virtual_ledger.jsonl")
+
 # Session safety. All times are New York exchange time.
 TIMEZONE = os.getenv("TRADING_TIMEZONE", "America/New_York")
 RTH_START = os.getenv("RTH_START", "09:30")
