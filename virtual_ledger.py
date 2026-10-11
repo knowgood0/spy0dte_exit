@@ -47,7 +47,7 @@ def ledger_path() -> str:
 
 
 def default_state() -> dict:
-    start = float(getattr(config, "VIRTUAL_START_BALANCE", 465.46))
+    start = float(getattr(config, "VIRTUAL_START_BALANCE", 497.88))
     milestones = sorted(
         float(m)
         for m in getattr(
