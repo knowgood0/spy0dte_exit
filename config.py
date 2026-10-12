@@ -75,6 +75,12 @@ MAX_HOLD_MINUTES = i("MAX_HOLD_MINUTES", MAX_BARS_IN_TRADE * 5)
 # stay tradeable. 0 disables.
 SIGNAL_PERSISTENCE_SECONDS = f("SIGNAL_PERSISTENCE_SECONDS", 30.0)
 
+# No-gate shadow diary: tracks what the pre-persistence strategy would have
+# done (enter immediately on every flip), paper and virtual-compounding.
+SHADOW_ENABLED = b("SHADOW_ENABLED", True)
+SHADOW_STATE_PATH = os.environ.get("SHADOW_STATE_PATH", "shadow_state.json")
+SHADOW_DIARY_PATH = os.environ.get("SHADOW_DIARY_PATH", "shadow_diary.jsonl")
+
 # Virtual compounding shadow ledger: a virtual sub-account that previews the
 # live milestone ladder (skim half at $1k/$5k/$10k/$20k/$30k, then doubling)
 # without touching real order sizing. Starts at the paper account's realized
