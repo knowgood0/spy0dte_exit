@@ -67,6 +67,12 @@ OPTION_BREAKEVEN_FLOOR_PCT = f("OPTION_BREAKEVEN_FLOOR_PCT", 0.10)
 OPTION_TRAILING_STOP_PCT = f("OPTION_TRAILING_STOP_PCT", 0.11)
 MAX_HOLD_MINUTES = i("MAX_HOLD_MINUTES", MAX_BARS_IN_TRADE * 5)
 
+# Flip persistence: an intrabar trend-flip signal must remain continuously
+# present for this long before it becomes a tradeable entry. Filters
+# whipsaw flips that reverse within seconds (e.g. both 2026-10-12 morning
+# trades reversed in <15s). 0 disables.
+SIGNAL_PERSISTENCE_SECONDS = f("SIGNAL_PERSISTENCE_SECONDS", 60.0)
+
 # Virtual compounding shadow ledger: a virtual sub-account that previews the
 # live milestone ladder (skim half at $1k/$5k/$10k/$20k/$30k, then doubling)
 # without touching real order sizing. Starts at the paper account's realized
