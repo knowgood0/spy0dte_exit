@@ -287,6 +287,50 @@ def abandon_stale() -> None:
     log.info("SHADOW: abandoned stale open record %s", rec.get("id"))
 
 
+def replay_trade(day: str, symbol: str, direction: str, entry_premium, exit_premium, note: str = "") -> None:
+    """Backfill one historical no-gate trade (Sep 14+ era, pre-gate).
+
+    Paper side: exact 1-contract P&L. Virtual side: sized off the running
+    shadow-virtual balance with the standard skim/tax rules. `day` is an
+    explicit YYYY-MM-DD key so history doesn't land in today's bucket.
+    """
+    if not _enabled():
+        return
+    st = load()
+    try:
+        entry = float(entry_premium)
+        exit_px = float(exit_premium)
+        ok = entry > 0 and exit_px > 0
+    except (TypeError, ValueError):
+        ok = False
+    pnl_1c = round((exit_px - entry) * 100.0, 2) if ok else None
+    if pnl_1c is not None:
+        st["paper_pnl"] = round(float(st.get("paper_pnl", 0.0) or 0.0) + pnl_1c, 2)
+        st["paper_trades"] = int(st.get("paper_trades", 0) or 0) + 1
+        bd = st.setdefault("by_day", {}).setdefault(day, {"paper_pnl": 0.0, "trades": 0})
+        bd["paper_pnl"] = round(bd["paper_pnl"] + pnl_1c, 2)
+        bd["trades"] += 1
+    v = st["virtual"]
+    v_contracts = _v_entry(v, symbol, entry if ok else 0)
+    v_pnl = _v_exit(v, exit_px if ok else None, estimated=False)
+    _record(
+        {
+            "event": "replay",
+            "day": day,
+            "direction": direction,
+            "symbol": symbol,
+            "entry_premium": entry if ok else None,
+            "exit_premium": exit_px if ok else None,
+            "pnl_1c": pnl_1c,
+            "v_contracts": v_contracts,
+            "v_pnl": round(v_pnl, 2),
+            "v_balance": round(float(v.get("balance", 0.0) or 0.0), 2),
+            "note": note,
+        }
+    )
+    save(st)
+
+
 def on_signal(sig_id: str, direction: str, symbol: str, ask, spy, estimated: bool = False) -> None:
     """A fresh flip fired. In the no-gate universe this enters immediately."""
     if not _enabled():
