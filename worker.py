@@ -14,6 +14,31 @@ except ImportError:
 
 import config
 import virtual_ledger
+import shadow_diary
+
+
+def _shadow_quote(stream, symbol):
+    """Best-effort non-blocking option quote for the shadow diary.
+
+    Never stalls the live loop: subscribes, then reads whatever quote is
+    cached. Returns (bid, ask); either may be None.
+    """
+    try:
+        stream.subscribe_option(symbol)
+
+        quote = (
+            stream.option_quote_live(
+                symbol
+            )
+            or {}
+        )
+
+        return (
+            quote.get("bid"),
+            quote.get("ask"),
+        )
+    except Exception:
+        return None, None
 import webull_client as wb
 from strategy import Bar, analyze, levels
 
@@ -688,6 +713,11 @@ def entry_fill_state(
         except Exception:
             log.exception("virtual ledger entry hook failed")
 
+        try:
+            shadow_diary.mark_delayed()
+        except Exception:
+            log.exception("shadow diary entry hook failed")
+
         log.info(
             "STATE PENDING_ENTRY -> OPEN: "
             "actual_qty=%s entry_premium=%s order_status=%s",
@@ -864,6 +894,11 @@ def reconcile_exit(
     )
 
     if remaining == 0:
+        entry_prem = (
+            state.get("position")
+            or {}
+        ).get("entry_premium")
+
         state["state"] = "FLAT"
         state["position"] = None
         state["exit_order"] = None
@@ -887,6 +922,14 @@ def reconcile_exit(
             )
         except Exception:
             log.exception("virtual ledger exit hook failed")
+
+        try:
+            shadow_diary.resolve_delayed(
+                detail.get("filled_price"),
+                entry_prem,
+            )
+        except Exception:
+            log.exception("shadow diary exit hook failed")
 
         return state, True
 
@@ -1291,6 +1334,11 @@ def retry_stale_exit(
     )
 
     if remaining <= 0:
+        entry_prem = (
+            state.get("position")
+            or {}
+        ).get("entry_premium")
+
         state["state"] = "FLAT"
         state["position"] = None
         state["exit_order"] = None
@@ -1302,6 +1350,11 @@ def retry_stale_exit(
             virtual_ledger.on_exit(None)
         except Exception:
             log.exception("virtual ledger exit hook failed")
+
+        try:
+            shadow_diary.resolve_delayed(None, entry_prem)
+        except Exception:
+            log.exception("shadow diary exit hook failed")
 
         return state
 
@@ -2255,6 +2308,11 @@ def main():
     next_position_reconcile = 0.0
     cached_position_result = None
 
+    try:
+        shadow_diary.abandon_stale()
+    except Exception:
+        log.exception("shadow diary startup clear failed")
+
     while running:
         try:
             # ------------------------------------------------
@@ -2460,7 +2518,9 @@ def main():
             # new bar only if its trend is still intact (no reversal
             # since the flip). The original flip timestamp carries
             # with it, so the persistence clock keeps running across
-            # the boundary instead of the signal dying there.
+            # the boundary instead of the signal dying there. If the
+            # trend reversed, the transition block below clears the
+            # timer (and closes the no-gate shadow) as usual.
             if (
                 current_bar_id
                 != last_signal_bar_id
@@ -2468,34 +2528,6 @@ def main():
                 last_signal_bar_id = (
                     current_bar_id
                 )
-
-                trend_intact = (
-                    last_signal_flip_ts
-                    is not None
-                    and last_signal_value
-                    in (
-                        "CALL",
-                        "PUT",
-                    )
-                    and (
-                        (
-                            last_signal_value
-                            == "CALL"
-                            and current_trend
-                            == 1
-                        )
-                        or (
-                            last_signal_value
-                            == "PUT"
-                            and current_trend
-                            == -1
-                        )
-                    )
-                )
-
-                if not trend_intact:
-                    last_signal_value = None
-                    last_signal_flip_ts = None
 
             # A carried flip counts as a live signal while its trend
             # stays intact, so a late-bar flip remains tradeable on
@@ -2575,6 +2607,38 @@ def main():
             # re-earn its persistence; the event id alone cannot
             # tell those apart.
             if signal != last_signal_value:
+                # No-gate shadow: the dying flip's hypothetical trade
+                # is stopped here (underlying stop), priced at the live
+                # bid. Delayed shadows (real trade in flight) are left
+                # alone; they resolve at the real exit.
+                if last_signal_value in (
+                    "CALL",
+                    "PUT",
+                ):
+                    try:
+                        _rec = shadow_diary.peek_open()
+
+                        if (
+                            _rec
+                            and not _rec.get(
+                                "delayed"
+                            )
+                        ):
+                            _bid, _ask = _shadow_quote(
+                                stream,
+                                _rec.get(
+                                    "symbol"
+                                ),
+                            )
+
+                            shadow_diary.close_blocked(
+                                _bid
+                            )
+                    except Exception:
+                        log.exception(
+                            "shadow close hook failed"
+                        )
+
                 last_signal_value = signal
 
                 last_signal_flip_ts = (
@@ -2582,6 +2646,60 @@ def main():
                     if signal
                     else None
                 )
+
+                # No-gate shadow: a fresh flip opens a hypothetical
+                # trade immediately at the live ask. Only when flat:
+                # the shadow universe parallels the real one.
+                if (
+                    signal
+                    and state.get(
+                        "state"
+                    )
+                    == "FLAT"
+                ):
+                    try:
+                        _contract = wb.choose(
+                            data,
+                            signal,
+                            snapshot.get(
+                                "close"
+                            ),
+                        )
+
+                        _symbol = (
+                            _contract
+                            or {}
+                        ).get(
+                            "symbol"
+                        )
+
+                        if _symbol:
+                            _bid, _ask = _shadow_quote(
+                                stream,
+                                _symbol,
+                            )
+
+                            shadow_diary.on_signal(
+                                sig_id=(
+                                    signal_event_id
+                                    + "@"
+                                    + str(
+                                        int(
+                                            time.time()
+                                        )
+                                    )
+                                ),
+                                direction=signal,
+                                symbol=_symbol,
+                                ask=_ask,
+                                spy=snapshot.get(
+                                    "close"
+                                ),
+                            )
+                    except Exception:
+                        log.exception(
+                            "shadow open hook failed"
+                        )
 
             snapshot[
                 "signal_flip_ts"
