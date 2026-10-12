@@ -2250,6 +2250,7 @@ def main():
     last_signal_event = None
     last_signal_value = None
     last_signal_flip_ts = None
+    last_signal_bar_id = None
 
     next_position_reconcile = 0.0
     cached_position_result = None
@@ -2454,6 +2455,100 @@ def main():
                 )
 
                 last_trend = current_trend
+
+            # Bar roll: a flip from the closed bar carries into the
+            # new bar only if its trend is still intact (no reversal
+            # since the flip). The original flip timestamp carries
+            # with it, so the persistence clock keeps running across
+            # the boundary instead of the signal dying there.
+            if (
+                current_bar_id
+                != last_signal_bar_id
+            ):
+                last_signal_bar_id = (
+                    current_bar_id
+                )
+
+                trend_intact = (
+                    last_signal_flip_ts
+                    is not None
+                    and last_signal_value
+                    in (
+                        "CALL",
+                        "PUT",
+                    )
+                    and (
+                        (
+                            last_signal_value
+                            == "CALL"
+                            and current_trend
+                            == 1
+                        )
+                        or (
+                            last_signal_value
+                            == "PUT"
+                            and current_trend
+                            == -1
+                        )
+                    )
+                )
+
+                if not trend_intact:
+                    last_signal_value = None
+                    last_signal_flip_ts = None
+
+            # A carried flip counts as a live signal while its trend
+            # stays intact, so a late-bar flip remains tradeable on
+            # the new bar once its persistence is earned. Any reversal
+            # fails the intact check and the carry dies as usual.
+            if (
+                not signal
+                and last_signal_value
+                in (
+                    "CALL",
+                    "PUT",
+                )
+                and (
+                    (
+                        last_signal_value
+                        == "CALL"
+                        and current_trend
+                        == 1
+                    )
+                    or (
+                        last_signal_value
+                        == "PUT"
+                        and current_trend
+                        == -1
+                    )
+                )
+            ):
+                signal = last_signal_value
+
+                signal_event_id = (
+                    current_bar_id
+                    + ":"
+                    + signal
+                )
+
+                snapshot[
+                    "signal"
+                ] = signal
+
+                snapshot[
+                    "signal_event_id"
+                ] = signal_event_id
+
+                log.info(
+                    "SIGNAL CARRIED across bar: %s "
+                    "SPY=%.2f flip_age=%.0fs",
+                    signal,
+                    snapshot[
+                        "close"
+                    ],
+                    time.time()
+                    - last_signal_flip_ts,
+                )
 
             if (
                 signal
@@ -2666,6 +2761,17 @@ def main():
                         state,
                         snapshot,
                     )
+
+                    # An entry was submitted: consume the signal so a
+                    # carried flip cannot re-fire on a later bar.
+                    if (
+                        state.get(
+                            "state"
+                        )
+                        != "FLAT"
+                    ):
+                        last_signal_value = None
+                        last_signal_flip_ts = None
 
                     save(state)
 
