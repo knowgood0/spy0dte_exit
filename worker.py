@@ -1894,6 +1894,35 @@ def maybe_enter(
     ):
         return state
 
+    # Flip persistence: the signal must have been continuously
+    # present for at least SIGNAL_PERSISTENCE_SECONDS. A flip
+    # that reverses within seconds (whipsaw) never becomes
+    # tradeable. 0 disables.
+    if (
+        config.SIGNAL_PERSISTENCE_SECONDS
+        > 0
+    ):
+        flip_ts = snapshot.get(
+            "signal_flip_ts"
+        )
+
+        if (
+            flip_ts is None
+            or time.time() - flip_ts
+            < config.SIGNAL_PERSISTENCE_SECONDS
+        ):
+            log.debug(
+                "ENTRY BLOCKED by persistence: signal age %.1fs < %.0fs",
+                (
+                    time.time() - flip_ts
+                    if flip_ts
+                    else -1.0
+                ),
+                config.SIGNAL_PERSISTENCE_SECONDS,
+            )
+
+            return state
+
     option_type = snapshot[
         "signal"
     ]
@@ -2219,6 +2248,8 @@ def main():
     last_logged_bar = None
     last_trend = None
     last_signal_event = None
+    last_signal_value = None
+    last_signal_flip_ts = None
 
     next_position_reconcile = 0.0
     cached_position_result = None
@@ -2442,6 +2473,24 @@ def main():
                 last_signal_event = (
                     signal_event_id
                 )
+
+            # Any signal transition — appearing, disappearing, or
+            # reversing — restarts the persistence clock. A flip
+            # that reverses and re-fires inside the same bar must
+            # re-earn its persistence; the event id alone cannot
+            # tell those apart.
+            if signal != last_signal_value:
+                last_signal_value = signal
+
+                last_signal_flip_ts = (
+                    time.time()
+                    if signal
+                    else None
+                )
+
+            snapshot[
+                "signal_flip_ts"
+            ] = last_signal_flip_ts
 
             # ------------------------------------------------
             # OPEN POSITION
