@@ -1759,38 +1759,80 @@ def submit_exit(
             "Could not record trade excursion"
         )
 
-    positions_result = wb.positions(
-        trade
-    )
-
-    if not positions_result.get(
-        "success"
-    ):
-        raise RuntimeError(
-            "Cannot verify Webull position before exit"
+    # Webull's positions feed can lag a fresh fill by a few seconds (we've
+    # seen this on fast entry->exit turns). Retry the lookup briefly before
+    # treating a missing position as a real problem.
+    actual = None
+    ambiguous_matches = None
+    last_positions_error = None
+    for _attempt in range(5):
+        positions_result = wb.positions(
+            trade
         )
 
-    actual = wb.find_matching_option_position(
-        positions_result.get(
-            "positions"
-        ),
-        pos.get(
-            "contract"
-        )
-        or {},
-        pos.get(
-            "side"
-        ),
-    )
+        if not positions_result.get(
+            "success"
+        ):
+            last_positions_error = positions_result
+            time.sleep(1.5)
+            continue
 
-    if (
-        not actual
-        or actual.get(
+        actual = wb.find_matching_option_position(
+            positions_result.get(
+                "positions"
+            ),
+            pos.get(
+                "contract"
+            )
+            or {},
+            pos.get(
+                "side"
+            ),
+        )
+
+        if actual and not actual.get(
             "ambiguous"
-        )
+        ):
+            break
+
+        if actual and actual.get(
+            "ambiguous"
+        ):
+            ambiguous_matches = actual.get(
+                "matches"
+            )
+            break
+
+        actual = None
+        time.sleep(1.5)
+
+    if actual and actual.get(
+        "ambiguous"
     ):
+        log.error(
+            "Ambiguous Webull position matches for %s: %s",
+            pos.get(
+                "symbol"
+            ),
+            ambiguous_matches,
+        )
         raise RuntimeError(
-            "Cannot uniquely verify Webull position before exit"
+            "Cannot uniquely verify Webull position before exit "
+            "(ambiguous matches)"
+        )
+
+    if not actual:
+        log.error(
+            "Webull position not found after retries for %s "
+            "(last positions result: %s)",
+            pos.get(
+                "symbol"
+            ),
+            last_positions_error,
+        )
+        raise RuntimeError(
+            "Cannot uniquely verify Webull position before exit "
+            "(not found after retries)"
         )
 
     quantity = int(
