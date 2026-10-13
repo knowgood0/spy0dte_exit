@@ -714,7 +714,9 @@ def entry_fill_state(
             log.exception("virtual ledger entry hook failed")
 
         try:
-            shadow_diary.mark_delayed()
+            shadow_diary.mark_delayed(
+                actual_entry,
+            )
         except Exception:
             log.exception("shadow diary entry hook failed")
 
