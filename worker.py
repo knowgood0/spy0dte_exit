@@ -15,6 +15,7 @@ except ImportError:
 import config
 import virtual_ledger
 import shadow_diary
+import tight_stop_ledger
 
 
 def _shadow_quote(stream, symbol):
@@ -896,10 +897,13 @@ def reconcile_exit(
     )
 
     if remaining == 0:
-        entry_prem = (
+        _pos_snapshot = (
             state.get("position")
             or {}
-        ).get("entry_premium")
+        )
+        entry_prem = _pos_snapshot.get(
+            "entry_premium"
+        )
 
         state["state"] = "FLAT"
         state["position"] = None
@@ -924,6 +928,20 @@ def reconcile_exit(
             )
         except Exception:
             log.exception("virtual ledger exit hook failed")
+
+        try:
+            tight_stop_ledger.on_trade(
+                entry_prem,
+                _pos_snapshot.get(
+                    "option_peak_premium"
+                ),
+                _pos_snapshot.get(
+                    "option_low_premium"
+                ),
+                detail.get("filled_price"),
+            )
+        except Exception:
+            log.exception("tight-stop ledger exit hook failed")
 
         try:
             shadow_diary.resolve_delayed(
