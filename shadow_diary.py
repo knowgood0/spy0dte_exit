@@ -455,14 +455,41 @@ def close_riding(exit_premium, reason: str = "SHADOW_RIDE_EXIT", estimated: bool
     _close_open(st, rec, exit_premium, estimated, reason, True)
 
 
-def mark_delayed() -> None:
-    """The real bot entered on this signal: shadow parallels the real trade."""
+def mark_delayed(entry_premium=None) -> None:
+    """The real bot entered on this signal: shadow parallels the real trade.
+
+    If the signal-time ask quote was unavailable (cold cache), fall back to
+    the real entry premium so the virtual side can still be sized; flagged
+    estimated. If no shadow is open (e.g. entry on a carried signal, which
+    has no fresh transition), record a note instead of inventing one.
+    """
     if not _enabled():
         return
     st = load()
     rec = st.get("open")
-    if not rec or rec.get("delayed"):
+    if not rec:
+        _record(
+            {
+                "event": "carried_entry_no_shadow",
+                "note": "real entry on a carried signal; no fresh flip, "
+                        "so no no-gate counterpart exists",
+            }
+        )
+        save(st)
         return
+    if rec.get("delayed"):
+        return
+    if rec.get("ask") is None and entry_premium:
+        try:
+            ep = float(entry_premium)
+            if ep > 0:
+                rec["ask"] = ep
+                rec["ask_estimated"] = True
+                v = st.get("virtual", {})
+                if not v.get("position"):
+                    _v_entry(v, rec.get("symbol"), ep)
+        except (TypeError, ValueError):
+            pass
     rec["delayed"] = True
     _record({"event": "delayed", "id": rec.get("id")})
     save(st)
