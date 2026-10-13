@@ -2306,6 +2306,7 @@ def main():
     last_signal_value = None
     last_signal_flip_ts = None
     last_signal_bar_id = None
+    last_carry_log_bar = None
 
     next_position_reconcile = 0.0
     cached_position_result = None
@@ -2573,16 +2574,24 @@ def main():
                     "signal_event_id"
                 ] = signal_event_id
 
-                log.info(
-                    "SIGNAL CARRIED across bar: %s "
-                    "SPY=%.2f flip_age=%.0fs",
-                    signal,
-                    snapshot[
-                        "close"
-                    ],
-                    time.time()
-                    - last_signal_flip_ts,
-                )
+                if (
+                    current_bar_id
+                    != last_carry_log_bar
+                ):
+                    last_carry_log_bar = (
+                        current_bar_id
+                    )
+
+                    log.info(
+                        "SIGNAL CARRIED across bar: %s "
+                        "SPY=%.2f flip_age=%.0fs",
+                        signal,
+                        snapshot[
+                            "close"
+                        ],
+                        time.time()
+                        - last_signal_flip_ts,
+                    )
 
             if (
                 signal
