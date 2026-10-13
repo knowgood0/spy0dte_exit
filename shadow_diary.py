@@ -74,23 +74,13 @@ def _tax_rate() -> float:
 
 
 def default_state() -> dict:
-    ms = _milestones()
     return {
         "open": None,
         "paper_pnl": 0.0,
         "paper_trades": 0,
         "by_day": {},
-        "virtual": {
-            "balance": _start_balance(),
-            "banked": 0.0,
-            "tax_reserve": 0.0,
-            "basis": _start_balance(),
-            "next_milestone": ms[0] if ms else None,
-            "trades": 0,
-            "skips": 0,
-            "skims": 0,
-            "position": None,
-        },
+        "virtual": _new_ledger(),
+        "fixed3": _new_ledger(),
     }
 
 
@@ -99,7 +89,8 @@ def load() -> dict:
         with open(state_path(), "r", encoding="utf-8") as fh:
             st = json.load(fh)
         if isinstance(st, dict):
-            st.setdefault("virtual", default_state()["virtual"])
+            st.setdefault("virtual", _new_ledger())
+            st.setdefault("fixed3", _new_ledger())
             return st
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
@@ -132,7 +123,7 @@ def _day_key() -> str:
 # Shadow virtual ledger (mirrors virtual_ledger's rules)
 # ------------------------------------------------------------
 
-def _v_advance_milestone(v: dict, hit: float) -> None:
+def _ledger_advance_milestone(ld: dict, hit: float) -> None:
     nxt = None
     for m in _milestones():
         if m > hit + 1e-9:
@@ -140,29 +131,30 @@ def _v_advance_milestone(v: dict, hit: float) -> None:
             break
     if nxt is None:
         nxt = hit * 2.0
-    v["next_milestone"] = nxt
+    ld["next_milestone"] = nxt
 
 
-def _v_skim(v: dict) -> None:
+def _ledger_skim(ld: dict, tag: str) -> None:
     rate = _tax_rate()
     while True:
-        nxt = v.get("next_milestone")
-        balance = float(v.get("balance", 0.0) or 0.0)
+        nxt = ld.get("next_milestone")
+        balance = float(ld.get("balance", 0.0) or 0.0)
         if not nxt or balance < float(nxt):
             break
         hit = float(nxt)
         skim = balance / 2.0
-        gains = balance - float(v.get("basis", balance) or balance)
+        gains = balance - float(ld.get("basis", balance) or balance)
         tax = rate * max(gains, 0.0)
         banked = skim - tax
-        v["banked"] = float(v.get("banked", 0.0) or 0.0) + banked
-        v["tax_reserve"] = float(v.get("tax_reserve", 0.0) or 0.0) + tax
-        v["balance"] = skim
-        v["basis"] = skim
-        v["skims"] = int(v.get("skims", 0) or 0) + 1
+        ld["banked"] = float(ld.get("banked", 0.0) or 0.0) + banked
+        ld["tax_reserve"] = float(ld.get("tax_reserve", 0.0) or 0.0) + tax
+        ld["balance"] = skim
+        ld["basis"] = skim
+        ld["skims"] = int(ld.get("skims", 0) or 0) + 1
         log.info(
-            "SHADOW VIRTUAL SKIM (milestone $%.0f): bank $%.2f, tax $%.2f, "
+            "SHADOW %s SKIM (milestone $%.0f): bank $%.2f, tax $%.2f, "
             "compounding $%.2f",
+            tag,
             hit,
             banked,
             tax,
@@ -170,14 +162,49 @@ def _v_skim(v: dict) -> None:
         )
         _record(
             {
-                "event": "v_skim",
+                "event": "ledger_skim",
+                "ledger": tag,
                 "milestone": hit,
                 "to_bank": round(banked, 2),
                 "to_tax_reserve": round(tax, 2),
                 "compounding": round(skim, 2),
             }
         )
-        _v_advance_milestone(v, hit)
+        _ledger_advance_milestone(ld, hit)
+
+
+def _v_advance_milestone(v: dict, hit: float) -> None:
+    _ledger_advance_milestone(v, hit)
+
+
+def _v_skim(v: dict) -> None:
+    _ledger_skim(v, "VIRTUAL")
+
+
+def _ledger_apply_pnl(ld: dict, pnl: float, tag: str) -> None:
+    """Add a dollar P&L to a compounding ledger (balance + skim rules)."""
+    if not pnl:
+        return
+    ld["balance"] = round(
+        float(ld.get("balance", 0.0) or 0.0) + float(pnl), 2
+    )
+    ld["trades"] = int(ld.get("trades", 0) or 0) + 1
+    _ledger_skim(ld, tag)
+
+
+def _new_ledger() -> dict:
+    ms = _milestones()
+    return {
+        "balance": _start_balance(),
+        "banked": 0.0,
+        "tax_reserve": 0.0,
+        "basis": _start_balance(),
+        "next_milestone": ms[0] if ms else None,
+        "trades": 0,
+        "skips": 0,
+        "skims": 0,
+        "position": None,
+    }
 
 
 def _v_entry(v: dict, symbol: str, premium) -> int:
@@ -229,8 +256,11 @@ def _v_exit(v: dict, exit_premium, estimated: bool = False) -> float:
     pnl = 0.0
     if contracts > 0 and entry > 0:
         pnl = contracts * (exit_px - entry) * 100.0
-        v["balance"] = float(v.get("balance", 0.0) or 0.0) + pnl
     v["trades"] = int(v.get("trades", 0) or 0) + 1
+    if pnl:
+        v["balance"] = round(
+            float(v.get("balance", 0.0) or 0.0) + pnl, 2
+        )
     log.info(
         "SHADOW VIRTUAL EXIT: %s x%d in $%.2f out $%.2f%s pnl $%+.2f "
         "balance $%.2f",
@@ -255,6 +285,31 @@ def _v_exit(v: dict, exit_premium, estimated: bool = False) -> float:
         }
     )
     _v_skim(v)
+    return pnl
+
+
+def _f3_apply(st: dict, pnl_1c) -> float:
+    """Apply a 1-contract paper P&L to the fixed-3-contract ledger."""
+    try:
+        p1 = float(pnl_1c)
+    except (TypeError, ValueError):
+        return 0.0
+    if p1 == 0:
+        return 0.0
+    f3 = st.get("fixed3")
+    if not isinstance(f3, dict):
+        f3 = _new_ledger()
+        st["fixed3"] = f3
+    pnl = round(3.0 * p1, 2)
+    _ledger_apply_pnl(f3, pnl, "FIXED3")
+    _record(
+        {
+            "event": "f3_apply",
+            "pnl_1c": round(p1, 2),
+            "pnl": pnl,
+            "balance": round(float(f3.get("balance", 0.0) or 0.0), 2),
+        }
+    )
     return pnl
 
 
@@ -313,6 +368,7 @@ def replay_trade(day: str, symbol: str, direction: str, entry_premium, exit_prem
     v = st["virtual"]
     v_contracts = _v_entry(v, symbol, entry if ok else 0)
     v_pnl = _v_exit(v, exit_px if ok else None, estimated=False)
+    f3_pnl = _f3_apply(st, pnl_1c)
     _record(
         {
             "event": "replay",
@@ -325,6 +381,8 @@ def replay_trade(day: str, symbol: str, direction: str, entry_premium, exit_prem
             "v_contracts": v_contracts,
             "v_pnl": round(v_pnl, 2),
             "v_balance": round(float(v.get("balance", 0.0) or 0.0), 2),
+            "f3_pnl": round(f3_pnl, 2),
+            "f3_balance": round(float(st["fixed3"].get("balance", 0.0) or 0.0), 2),
             "note": note,
         }
     )
@@ -409,6 +467,7 @@ def _close_open(st: dict, rec: dict, bid, bid_estimated: bool, reason: str, est_
         bd["paper_pnl"] = round(bd["paper_pnl"] + pnl_1c, 2)
         bd["trades"] += 1
     v_pnl = _v_exit(st["virtual"], bid_f if bid_ok else None, estimated=bid_estimated)
+    f3_pnl = _f3_apply(st, pnl_1c)
     _record(
         {
             "event": "close_blocked",
@@ -421,6 +480,8 @@ def _close_open(st: dict, rec: dict, bid, bid_estimated: bool, reason: str, est_
             "pnl_1c": pnl_1c,
             "v_pnl": round(v_pnl, 2),
             "v_balance": round(float(st["virtual"].get("balance", 0.0) or 0.0), 2),
+            "f3_pnl": round(f3_pnl, 2),
+            "f3_balance": round(float(st["fixed3"].get("balance", 0.0) or 0.0), 2),
         }
     )
     save(st)
@@ -529,6 +590,7 @@ def resolve_delayed(exit_premium, real_entry_premium) -> None:
     if pos:
         pos["entry_premium"] = ask or pos.get("entry_premium")
     v_pnl = _v_exit(v, exit_premium, estimated=True)
+    f3_pnl = _f3_apply(st, pnl_1c)
     _record(
         {
             "event": "close_delayed",
@@ -541,6 +603,8 @@ def resolve_delayed(exit_premium, real_entry_premium) -> None:
             "pnl_1c": pnl_1c,
             "v_pnl": round(v_pnl, 2),
             "v_balance": round(float(v.get("balance", 0.0) or 0.0), 2),
+            "f3_pnl": round(f3_pnl, 2),
+            "f3_balance": round(float(st["fixed3"].get("balance", 0.0) or 0.0), 2),
         }
     )
     save(st)
@@ -552,10 +616,70 @@ def resolve_delayed(exit_premium, real_entry_premium) -> None:
     )
 
 
+def backfill_fixed3() -> dict:
+    """Rebuild the fixed-3-contract ledger from the diary's close records.
+
+    Each closed shadow trade contributes 3x its 1-contract paper P&L,
+    applied in diary order with the standard skim/tax rules. One-time
+    history reconstruction; live closes hook in automatically.
+    """
+    if not _enabled():
+        return {}
+    st = load()
+    st["fixed3"] = _new_ledger()
+    applied = 0
+    try:
+        with open(diary_path(), "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if d.get("event") not in (
+                    "close_blocked",
+                    "close_delayed",
+                    "replay",
+                ):
+                    continue
+                pnl_1c = d.get("pnl_1c")
+                try:
+                    p1 = float(pnl_1c)
+                except (TypeError, ValueError):
+                    continue
+                if p1 == 0:
+                    continue
+                _ledger_apply_pnl(st["fixed3"], round(3.0 * p1, 2), "FIXED3")
+                applied += 1
+    except (FileNotFoundError, OSError):
+        pass
+    f3 = st["fixed3"]
+    _record(
+        {
+            "event": "f3_backfill",
+            "trades_applied": applied,
+            "balance": round(float(f3.get("balance", 0.0) or 0.0), 2),
+            "banked": round(float(f3.get("banked", 0.0) or 0.0), 2),
+            "tax_reserve": round(float(f3.get("tax_reserve", 0.0) or 0.0), 2),
+            "skims": f3.get("skims", 0),
+        }
+    )
+    save(st)
+    log.info(
+        "SHADOW FIXED3 BACKFILL: %d trades -> balance $%.2f",
+        applied,
+        float(f3.get("balance", 0.0) or 0.0),
+    )
+    return summary()
+
+
 def summary() -> dict:
     """One-line status for health checks."""
     st = load()
     v = st.get("virtual", {})
+    f3 = st.get("fixed3", {})
     return {
         "paper_pnl": round(float(st.get("paper_pnl", 0.0) or 0.0), 2),
         "paper_trades": st.get("paper_trades", 0),
@@ -564,5 +688,10 @@ def summary() -> dict:
         "v_tax": round(float(v.get("tax_reserve", 0.0) or 0.0), 2),
         "v_trades": v.get("trades", 0),
         "v_skims": v.get("skims", 0),
+        "f3_balance": round(float(f3.get("balance", 0.0) or 0.0), 2),
+        "f3_banked": round(float(f3.get("banked", 0.0) or 0.0), 2),
+        "f3_tax": round(float(f3.get("tax_reserve", 0.0) or 0.0), 2),
+        "f3_trades": f3.get("trades", 0),
+        "f3_skims": f3.get("skims", 0),
         "open": bool(st.get("open")),
     }
