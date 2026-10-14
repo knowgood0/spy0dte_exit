@@ -16,6 +16,7 @@ import config
 import virtual_ledger
 import shadow_diary
 import tight_stop_ledger
+import grind_shadow
 
 
 def _shadow_quote(stream, symbol):
@@ -2775,6 +2776,67 @@ def main():
             snapshot[
                 "signal_flip_ts"
             ] = last_signal_flip_ts
+
+            # Continuation ("grind") shadow: hypothetical paper trades on
+            # sustained trends without a flip. Live logic untouched.
+            try:
+                _g_lows = [
+                    b.low
+                    for b in history[
+                        -grind_shadow.GRIND_LOOKBACK_BARS
+                        - 1 :
+                    ]
+                ]
+                _g_highs = [
+                    b.high
+                    for b in history[
+                        -grind_shadow.GRIND_LOOKBACK_BARS
+                        - 1 :
+                    ]
+                ]
+
+                def _grind_pick_quote(
+                    direction,
+                ):
+                    _c = wb.choose(
+                        data,
+                        direction,
+                        snapshot.get(
+                            "close"
+                        ),
+                    )
+                    _s = (
+                        _c
+                        or {}
+                    ).get(
+                        "symbol"
+                    )
+                    if not _s:
+                        return None
+                    _b, _a = _shadow_quote(
+                        stream,
+                        _s,
+                    )
+                    return (
+                        _s,
+                        _b,
+                        _a,
+                    )
+
+                grind_shadow.on_tick(
+                    trend=current_trend,
+                    lows=_g_lows,
+                    highs=_g_highs,
+                    spy=snapshot.get(
+                        "close"
+                    ),
+                    pick_quote=_grind_pick_quote,
+                    can_enter=new_entries_allowed(),
+                )
+            except Exception:
+                log.exception(
+                    "grind shadow tick failed"
+                )
 
             # ------------------------------------------------
             # OPEN POSITION
